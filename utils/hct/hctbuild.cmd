@@ -247,9 +247,9 @@ if "%DO_SETUP%"=="1" (
     type %3\cmake-log.txt
     echo ===== end cmake-log.txt =====
     echo Run 'cmake %HLSL_SRC_DIR%' in %3 will continue project generation after fixing the issue.
-    cmake --version | findstr 3.4
+    cmake --version | findstr 3.8
     if errorlevel 1 (
-      echo CMake 3.4 is the currently supported version - your installed cmake may be out of date.
+      echo CMake 3.8 is the currently supported version - your installed cmake may be out of date.
       echo See README.md at the root for an explanation of dependencies.
     )
     findstr -c:"Could NOT find D3D12" %3\cmake-log.txt >NUL
