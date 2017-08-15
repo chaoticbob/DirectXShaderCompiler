@@ -213,7 +213,7 @@ cmake --version | findstr 3.4.3 1>nul 2>nul
 if "0"=="%ERRORLEVEL%" exit /b 0
 cmake --version | findstr 3.7.2 1>nul 2>nul
 if "0"=="%ERRORLEVEL%" exit /b 0
-cmake --version | findstr 3.8.2 1>nul 2>nul
+cmake --version | findstr 3.8 1>nul 2>nul
 if "0"=="%ERRORLEVEL%" exit /b 0
 cmake --version | findstr /R 3.6.*MSVC 1>nul 2>nul
 if errorlevel 1 (
