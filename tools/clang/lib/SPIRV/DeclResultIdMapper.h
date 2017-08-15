@@ -17,6 +17,7 @@
 #include "dxc/HLSL/DxilSigPoint.h"
 #include "spirv/1.0/spirv.hpp11"
 #include "clang/AST/Attr.h"
+#include "clang/SPIRV/EmitSPIRVOptions.h"
 #include "clang/SPIRV/ModuleBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Optional.h"
@@ -33,8 +34,10 @@ namespace spirv {
 class StageVar {
 public:
   inline StageVar(const hlsl::SigPoint *sig, llvm::StringRef semaStr,
-                  const hlsl::Semantic *sema, uint32_t semaIndex,
-                  uint32_t type);
+                  const hlsl::Semantic *sema, uint32_t semaIndex, uint32_t type)
+      : sigPoint(sig), semanticStr(semaStr), semantic(sema),
+        semanticIndex(semaIndex), typeId(type), valueId(0), isBuiltin(false),
+        storageClass(spv::StorageClass::Max), location(nullptr) {}
 
   const hlsl::SigPoint *getSigPoint() const { return sigPoint; }
   const hlsl::Semantic *getSemantic() const { return semantic; }
@@ -78,12 +81,21 @@ private:
   const VKLocationAttr *location;
 };
 
-StageVar::StageVar(const hlsl::SigPoint *sig, llvm::StringRef semaStr,
-                   const hlsl::Semantic *sema, uint32_t semaIndex,
-                   uint32_t type)
-    : sigPoint(sig), semanticStr(semaStr), semantic(sema),
-      semanticIndex(semaIndex), typeId(type), valueId(0), isBuiltin(false),
-      storageClass(spv::StorageClass::Max), location(nullptr) {}
+class ResourceVar {
+public:
+  ResourceVar(uint32_t id, const hlsl::RegisterAssignment *r,
+              const VKBindingAttr *b)
+      : varId(id), reg(r), binding(b) {}
+
+  uint32_t getSpirvId() const { return varId; }
+  const hlsl::RegisterAssignment *getRegister() const { return reg; }
+  const VKBindingAttr *getBinding() const { return binding; }
+
+private:
+  uint32_t varId;                      ///< <result-id>
+  const hlsl::RegisterAssignment *reg; ///< HLSL register assignment
+  const VKBindingAttr *binding;        ///< Vulkan binding assignment
+};
 
 /// \brief The class containing mappings from Clang frontend Decls to their
 /// corresponding SPIR-V <result-id>s.
@@ -104,7 +116,8 @@ StageVar::StageVar(const hlsl::SigPoint *sig, llvm::StringRef semaStr,
 class DeclResultIdMapper {
 public:
   inline DeclResultIdMapper(const hlsl::ShaderModel &stage, ASTContext &context,
-                            ModuleBuilder &builder, DiagnosticsEngine &diag);
+                            ModuleBuilder &builder, DiagnosticsEngine &diag,
+                            const EmitSPIRVOptions &spirvOptions);
 
   /// \brief Creates the stage output variables by parsing the semantics
   /// attached to the given function's parameter or return value and returns
@@ -175,6 +188,13 @@ public:
   /// construction.
   inline bool decorateStageIOLocations();
 
+  /// \brief Decorates all resource variables with proper set and binding
+  /// numbers and returns true on success.
+  ///
+  /// This method will write the set and binding number assignment into the
+  /// module under construction.
+  bool decorateResourceBindings();
+
 private:
   /// \brief Wrapper method to create an error message and report it
   /// in the diagnostic engine associated with this consumer.
@@ -215,14 +235,13 @@ private:
   /// creating a stage input/output variable.
   uint32_t createSpirvStageVar(StageVar *, const llvm::Twine &name);
 
-  /// \brief Returns the stage variable's semantic for the given Decl.
-  static llvm::StringRef getStageVarSemantic(const NamedDecl *decl);
-
 private:
   const hlsl::ShaderModel &shaderModel;
   ModuleBuilder &theBuilder;
-  TypeTranslator typeTranslator;
+  const EmitSPIRVOptions &spirvOptions;
   DiagnosticsEngine &diags;
+
+  TypeTranslator typeTranslator;
 
   uint32_t entryFunctionId;
 
@@ -230,14 +249,17 @@ private:
   llvm::DenseMap<const NamedDecl *, DeclSpirvInfo> astDecls;
   /// Vector of all defined stage variables.
   llvm::SmallVector<StageVar, 8> stageVars;
+  /// Vector of all defined resource variables.
+  llvm::SmallVector<ResourceVar, 8> resourceVars;
 };
 
 DeclResultIdMapper::DeclResultIdMapper(const hlsl::ShaderModel &model,
                                        ASTContext &context,
                                        ModuleBuilder &builder,
-                                       DiagnosticsEngine &diag)
-    : shaderModel(model), theBuilder(builder),
-      typeTranslator(context, builder, diag), diags(diag), entryFunctionId(0) {}
+                                       DiagnosticsEngine &diag,
+                                       const EmitSPIRVOptions &options)
+    : shaderModel(model), theBuilder(builder), spirvOptions(options),
+      diags(diag), typeTranslator(context, builder, diag), entryFunctionId(0) {}
 
 bool DeclResultIdMapper::decorateStageIOLocations() {
   // Try both input and output even if input location assignment failed

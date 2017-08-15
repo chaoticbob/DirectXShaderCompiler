@@ -210,10 +210,10 @@ uint32_t ModuleBuilder::createBinaryOp(spv::Op op, uint32_t resultType,
   return id;
 }
 
-namespace {
-spv::ImageOperandsMask composeImageOperandsMask(
+spv::ImageOperandsMask ModuleBuilder::composeImageOperandsMask(
     uint32_t bias, uint32_t lod, const std::pair<uint32_t, uint32_t> &grad,
-    uint32_t constOffset, llvm::SmallVectorImpl<uint32_t> *orderedParams) {
+    uint32_t constOffset, uint32_t varOffset,
+    llvm::SmallVectorImpl<uint32_t> *orderedParams) {
   using spv::ImageOperandsMask;
   // SPIR-V Image Operands from least significant bit to most significant bit
   // Bias, Lod, Grad, ConstOffset, Offset, ConstOffsets, Sample, MinLod
@@ -242,16 +242,22 @@ spv::ImageOperandsMask composeImageOperandsMask(
     orderedParams->push_back(constOffset);
   }
 
+  if (varOffset) {
+    mask = mask | ImageOperandsMask::Offset;
+    requireCapability(spv::Capability::ImageGatherExtended);
+    orderedParams->push_back(varOffset);
+  }
+
   return mask;
 }
-} // anonymous namespace
 
 uint32_t ModuleBuilder::createImageSample(uint32_t texelType,
                                           uint32_t imageType, uint32_t image,
                                           uint32_t sampler, uint32_t coordinate,
                                           uint32_t bias, uint32_t lod,
                                           std::pair<uint32_t, uint32_t> grad,
-                                          uint32_t offset) {
+                                          uint32_t constOffset,
+                                          uint32_t varOffset) {
   assert(insertPoint && "null insert point");
 
   // An OpSampledImage is required to do the image sampling.
@@ -262,7 +268,8 @@ uint32_t ModuleBuilder::createImageSample(uint32_t texelType,
 
   const uint32_t texelId = theContext.takeNextId();
   llvm::SmallVector<uint32_t, 4> params;
-  const auto mask = composeImageOperandsMask(bias, lod, grad, offset, &params);
+  const auto mask = composeImageOperandsMask(bias, lod, grad, constOffset,
+                                             varOffset, &params);
   // The Lod and Grad image operands requires explicit-lod instructions.
   if (lod || (grad.first && grad.second)) {
     instBuilder.opImageSampleExplicitLod(texelType, texelId, sampledImgId,
@@ -282,13 +289,15 @@ uint32_t ModuleBuilder::createImageSample(uint32_t texelType,
 
 uint32_t ModuleBuilder::createImageFetch(uint32_t texelType, uint32_t image,
                                          uint32_t coordinate, uint32_t lod,
-                                         uint32_t offset) {
+                                         uint32_t constOffset,
+                                         uint32_t varOffset) {
   assert(insertPoint && "null insert point");
 
   llvm::SmallVector<uint32_t, 2> params;
   const auto mask =
       llvm::Optional<spv::ImageOperandsMask>(composeImageOperandsMask(
-          /*bias*/ 0, lod, std::make_pair(0, 0), offset, &params));
+          /*bias*/ 0, lod, std::make_pair(0, 0), constOffset, varOffset,
+          &params));
 
   const uint32_t texelId = theContext.takeNextId();
   instBuilder.opImageFetch(texelType, texelId, image, coordinate, mask);
@@ -303,7 +312,9 @@ uint32_t ModuleBuilder::createImageFetch(uint32_t texelType, uint32_t image,
 uint32_t ModuleBuilder::createImageGather(uint32_t texelType,
                                           uint32_t imageType, uint32_t image,
                                           uint32_t sampler, uint32_t coordinate,
-                                          uint32_t component, uint32_t offset) {
+                                          uint32_t component,
+                                          uint32_t constOffset,
+                                          uint32_t varOffset) {
   assert(insertPoint && "null insert point");
 
   // An OpSampledImage is required to do the image sampling.
@@ -316,7 +327,8 @@ uint32_t ModuleBuilder::createImageGather(uint32_t texelType,
 
   const auto mask =
       llvm::Optional<spv::ImageOperandsMask>(composeImageOperandsMask(
-          /*bias*/ 0, /*lod*/ 0, std::make_pair(0, 0), offset, &params));
+          /*bias*/ 0, /*lod*/ 0, std::make_pair(0, 0), constOffset, varOffset,
+          &params));
   const uint32_t texelId = theContext.takeNextId();
   instBuilder.opImageGather(texelType, texelId, sampledImgId, coordinate,
                             component, mask);
@@ -454,7 +466,7 @@ uint32_t ModuleBuilder::addStageBuiltinVar(uint32_t type, spv::StorageClass sc,
 
   // Decorate with the specified Builtin
   const Decoration *d = Decoration::getBuiltIn(theContext, builtin);
-  theModule.addDecoration(*d, varId);
+  theModule.addDecoration(d, varId);
 
   return varId;
 }
@@ -473,10 +485,19 @@ uint32_t ModuleBuilder::addModuleVar(uint32_t type, spv::StorageClass sc,
   return varId;
 }
 
+void ModuleBuilder::decorateDSetBinding(uint32_t targetId, uint32_t setNumber,
+                                        uint32_t bindingNumber) {
+  const auto *d = Decoration::getDescriptorSet(theContext, setNumber);
+  theModule.addDecoration(d, targetId);
+
+  d = Decoration::getBinding(theContext, bindingNumber);
+  theModule.addDecoration(d, targetId);
+}
+
 void ModuleBuilder::decorateLocation(uint32_t targetId, uint32_t location) {
   const Decoration *d =
       Decoration::getLocation(theContext, location, llvm::None);
-  theModule.addDecoration(*d, targetId);
+  theModule.addDecoration(d, targetId);
 }
 
 void ModuleBuilder::decorate(uint32_t targetId, spv::Decoration decoration) {
@@ -497,7 +518,7 @@ void ModuleBuilder::decorate(uint32_t targetId, spv::Decoration decoration) {
   }
 
   assert(d && "unimplemented decoration");
-  theModule.addDecoration(*d, targetId);
+  theModule.addDecoration(d, targetId);
 }
 
 #define IMPL_GET_PRIMITIVE_TYPE(ty)                                            \
@@ -644,11 +665,39 @@ uint32_t ModuleBuilder::getSamplerType() {
   return typeId;
 }
 
+
 uint32_t ModuleBuilder::getSampledImageType(uint32_t imageType) {
   const Type *type = Type::getSampledImage(theContext, imageType);
   const uint32_t typeId = theContext.getResultIdForType(type);
   theModule.addType(type, typeId);
   theModule.addDebugName(typeId, "type.sampled.image");
+  return typeId;
+}
+
+uint32_t ModuleBuilder::getByteAddressBufferType(bool isRW) {
+  // Create a uint RuntimeArray with Array Stride of 4.
+  const uint32_t uintType = getUint32Type();
+  const auto *arrStride4 = Decoration::getArrayStride(theContext, 4u);
+  const Type *raType =
+      Type::getRuntimeArray(theContext, uintType, {arrStride4});
+  const uint32_t raTypeId = theContext.getResultIdForType(raType);
+  theModule.addType(raType, raTypeId);
+
+  // Create a struct containing the runtime array as its only member.
+  // The struct must also be decorated as BufferBlock. The offset decoration
+  // should also be applied to the first (only) member. NonWritable decoration
+  // should also be applied to the first member if isRW is true.
+  llvm::SmallVector<const Decoration*, 3> typeDecs;
+  typeDecs.push_back(Decoration::getBufferBlock(theContext));
+  typeDecs.push_back(Decoration::getOffset(theContext, 0, 0));
+  if (!isRW)
+    typeDecs.push_back(Decoration::getNonWritable(theContext, 0));
+
+  const Type *type = Type::getStruct(theContext, {raTypeId}, typeDecs);
+  const uint32_t typeId = theContext.getResultIdForType(type);
+  theModule.addType(type, typeId);
+  theModule.addDebugName(typeId, isRW ? "type.RWByteAddressBuffer"
+                                      : "type.ByteAddressBuffer");
   return typeId;
 }
 

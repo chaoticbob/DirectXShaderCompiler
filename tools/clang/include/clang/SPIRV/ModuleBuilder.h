@@ -157,17 +157,18 @@ public:
                              uint32_t image, uint32_t sampler,
                              uint32_t coordinate, uint32_t bias, uint32_t lod,
                              std::pair<uint32_t, uint32_t> grad,
-                             uint32_t offset);
+                             uint32_t constOffset, uint32_t varOffset);
 
   /// \brief Creates SPIR-V instructions for fetching the given image.
   uint32_t createImageFetch(uint32_t texelType, uint32_t image,
-                            uint32_t coordinate, uint32_t lod, uint32_t offset);
+                            uint32_t coordinate, uint32_t lod,
+                            uint32_t constOffset, uint32_t varOffset);
 
   /// \brief Creates SPIR-V instructions for sampling the given image.
   uint32_t createImageGather(uint32_t texelType, uint32_t imageType,
                              uint32_t image, uint32_t sampler,
                              uint32_t coordinate, uint32_t component,
-                             uint32_t offset);
+                             uint32_t constOffset, uint32_t varOffset);
 
   /// \brief Creates a select operation with the given values for true and false
   /// cases and returns the <result-id> for the result.
@@ -263,6 +264,11 @@ public:
   /// \brief Decorates the given target <result-id> with the given location.
   void decorateLocation(uint32_t targetId, uint32_t location);
 
+  /// \brief Decorates the given target <result-id> with the given descriptor
+  /// set and binding number.
+  void decorateDSetBinding(uint32_t targetId, uint32_t setNumber,
+                           uint32_t bindingNumber);
+
   /// \brief Decorates the given target <result-id> with the given decoration
   /// (without additional parameters).
   void decorate(uint32_t targetId, spv::Decoration);
@@ -286,6 +292,7 @@ public:
   uint32_t getImageType(uint32_t sampledType, spv::Dim, bool isArray);
   uint32_t getSamplerType();
   uint32_t getSampledImageType(uint32_t imageType);
+  uint32_t getByteAddressBufferType(bool isRW);
 
   // === Constant ===
   uint32_t getConstantBool(bool value);
@@ -308,6 +315,14 @@ private:
 
   /// \brief Returns the basic block with the given <label-id>.
   BasicBlock *getBasicBlock(uint32_t label);
+
+  /// \brief Returns the composed ImageOperandsMask from non-zero parameters
+  /// and pushes non-zero parameters to *orderedParams in the expected order.
+  spv::ImageOperandsMask
+  composeImageOperandsMask(uint32_t bias, uint32_t lod,
+                           const std::pair<uint32_t, uint32_t> &grad,
+                           uint32_t constOffset, uint32_t varOffset,
+                           llvm::SmallVectorImpl<uint32_t> *orderedParams);
 
   SPIRVContext &theContext; ///< The SPIR-V context.
   SPIRVModule theModule;    ///< The module under building.

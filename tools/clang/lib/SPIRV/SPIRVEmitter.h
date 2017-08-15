@@ -26,6 +26,7 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/SPIRV/EmitSPIRVOptions.h"
 #include "clang/SPIRV/ModuleBuilder.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -42,7 +43,7 @@ namespace spirv {
 /// through the AST is done manually instead of using ASTConsumer's harness.
 class SPIRVEmitter : public ASTConsumer {
 public:
-  explicit SPIRVEmitter(CompilerInstance &ci);
+  explicit SPIRVEmitter(CompilerInstance &ci, const EmitSPIRVOptions &options);
 
   void HandleTranslationUnit(ASTContext &context) override;
 
@@ -300,11 +301,15 @@ private:
   uint32_t translateAPFloat(const llvm::APFloat &floatValue,
                             QualType targetType);
 
+  /// Tries to evaluate the given Expr as a constant and returns the <result-id>
+  /// if success. Otherwise, returns 0.
+  uint32_t tryToEvaluateAsConst(const Expr *expr);
+
+private:
   /// Translates the given HLSL loop attribute into SPIR-V loop control mask.
   /// Emits an error if the given attribute is not a loop attribute.
   spv::LoopControlMask translateLoopAttribute(const Attr &);
 
-private:
   static spv::ExecutionModel
   getSpirvShaderStage(const hlsl::ShaderModel &model);
 
@@ -432,6 +437,8 @@ private:
   CompilerInstance &theCompilerInstance;
   ASTContext &astContext;
   DiagnosticsEngine &diags;
+
+  EmitSPIRVOptions spirvOptions;
 
   /// Entry function name and shader stage. Both of them are derived from the
   /// command line and should be const.
