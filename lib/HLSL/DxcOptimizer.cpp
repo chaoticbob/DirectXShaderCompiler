@@ -20,9 +20,11 @@
 #include "dxc/HLSL/HLMatrixLowerPass.h"
 #include "dxc/HLSL/DxilGenerationPass.h"
 #include "dxc/HLSL/ComputeViewIdState.h"
+#include "dxc/HLSL/DxilUtil.h"
 #include "dxc/Support/dxcapi.impl.h"
 
 #include "llvm/Pass.h"
+#include "llvm/PassInfo.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Bitcode/ReaderWriter.h"
@@ -85,6 +87,7 @@ HRESULT SetupRegistryPassForHLSL() {
     initializeDxilAddPixelHitInstrumentationPass(Registry);
     initializeDxilCondenseResourcesPass(Registry);
     initializeDxilDeadFunctionEliminationPass(Registry);
+    initializeDxilDebugInstrumentationPass(Registry);
     initializeDxilEliminateOutputDynamicIndexingPass(Registry);
     initializeDxilEmitMetadataPass(Registry);
     initializeDxilExpandTrigIntrinsicsPass(Registry);
@@ -134,12 +137,15 @@ HRESULT SetupRegistryPassForHLSL() {
     initializeMergeFunctionsPass(Registry);
     initializeMergedLoadStoreMotionPass(Registry);
     initializeMultiDimArrayToOneDimArrayPass(Registry);
+    initializeNoPausePassesPass(Registry);
+    initializePausePassesPass(Registry);
     initializePromotePassPass(Registry);
     initializePruneEHPass(Registry);
     initializeReassociatePass(Registry);
     initializeReducibilityAnalysisPass(Registry);
     initializeRegToMemHlslPass(Registry);
     initializeResourceToHandlePass(Registry);
+    initializeResumePassesPass(Registry);
     initializeRewriteSymbolsPass(Registry);
     initializeSCCPPass(Registry);
     initializeSROAPass(Registry);
@@ -176,6 +182,7 @@ static ArrayRef<LPCSTR> GetPassArgNames(LPCSTR passName) {
   static const LPCSTR ArgPromotionArgs[] = { "maxElements" };
   static const LPCSTR CFGSimplifyPassArgs[] = { "Threshold", "Ftor", "bonus-inst-threshold" };
   static const LPCSTR DxilAddPixelHitInstrumentationArgs[] = { "force-early-z", "add-pixel-cost", "rt-width", "sv-position-index", "num-pixels" };
+  static const LPCSTR DxilDebugInstrumentationArgs[] = { "UAVSize", "parameter0", "parameter1", "parameter2" };
   static const LPCSTR DxilGenerationPassArgs[] = { "NotOptimized" };
   static const LPCSTR DxilOutputColorBecomesConstantArgs[] = { "mod-mode", "constant-red", "constant-green", "constant-blue", "constant-alpha" };
   static const LPCSTR DynamicIndexingVectorToArrayArgs[] = { "ReplaceAllVectors" };
@@ -207,6 +214,7 @@ static ArrayRef<LPCSTR> GetPassArgNames(LPCSTR passName) {
   if (strcmp(passName, "argpromotion") == 0) return ArrayRef<LPCSTR>(ArgPromotionArgs, _countof(ArgPromotionArgs));
   if (strcmp(passName, "simplifycfg") == 0) return ArrayRef<LPCSTR>(CFGSimplifyPassArgs, _countof(CFGSimplifyPassArgs));
   if (strcmp(passName, "hlsl-dxil-add-pixel-hit-instrmentation") == 0) return ArrayRef<LPCSTR>(DxilAddPixelHitInstrumentationArgs, _countof(DxilAddPixelHitInstrumentationArgs));
+  if (strcmp(passName, "hlsl-dxil-debug-instrumentation") == 0) return ArrayRef<LPCSTR>(DxilDebugInstrumentationArgs, _countof(DxilDebugInstrumentationArgs));
   if (strcmp(passName, "dxilgen") == 0) return ArrayRef<LPCSTR>(DxilGenerationPassArgs, _countof(DxilGenerationPassArgs));
   if (strcmp(passName, "hlsl-dxil-constantColor") == 0) return ArrayRef<LPCSTR>(DxilOutputColorBecomesConstantArgs, _countof(DxilOutputColorBecomesConstantArgs));
   if (strcmp(passName, "dynamic-vector-to-array") == 0) return ArrayRef<LPCSTR>(DynamicIndexingVectorToArrayArgs, _countof(DynamicIndexingVectorToArrayArgs));
@@ -245,6 +253,7 @@ static ArrayRef<LPCSTR> GetPassArgDescriptions(LPCSTR passName) {
   static const LPCSTR ArgPromotionArgs[] = { "None" };
   static const LPCSTR CFGSimplifyPassArgs[] = { "None", "None", "Control the number of bonus instructions (default = 1)" };
   static const LPCSTR DxilAddPixelHitInstrumentationArgs[] = { "None", "None", "None", "None", "None" };
+  static const LPCSTR DxilDebugInstrumentationArgs[] = { "None", "None", "None", "None" };
   static const LPCSTR DxilGenerationPassArgs[] = { "None" };
   static const LPCSTR DxilOutputColorBecomesConstantArgs[] = { "None", "None", "None", "None", "None" };
   static const LPCSTR DynamicIndexingVectorToArrayArgs[] = { "None" };
@@ -276,6 +285,7 @@ static ArrayRef<LPCSTR> GetPassArgDescriptions(LPCSTR passName) {
   if (strcmp(passName, "argpromotion") == 0) return ArrayRef<LPCSTR>(ArgPromotionArgs, _countof(ArgPromotionArgs));
   if (strcmp(passName, "simplifycfg") == 0) return ArrayRef<LPCSTR>(CFGSimplifyPassArgs, _countof(CFGSimplifyPassArgs));
   if (strcmp(passName, "hlsl-dxil-add-pixel-hit-instrmentation") == 0) return ArrayRef<LPCSTR>(DxilAddPixelHitInstrumentationArgs, _countof(DxilAddPixelHitInstrumentationArgs));
+  if (strcmp(passName, "hlsl-dxil-debug-instrumentation") == 0) return ArrayRef<LPCSTR>(DxilDebugInstrumentationArgs, _countof(DxilDebugInstrumentationArgs));
   if (strcmp(passName, "dxilgen") == 0) return ArrayRef<LPCSTR>(DxilGenerationPassArgs, _countof(DxilGenerationPassArgs));
   if (strcmp(passName, "hlsl-dxil-constantColor") == 0) return ArrayRef<LPCSTR>(DxilOutputColorBecomesConstantArgs, _countof(DxilOutputColorBecomesConstantArgs));
   if (strcmp(passName, "dynamic-vector-to-array") == 0) return ArrayRef<LPCSTR>(DynamicIndexingVectorToArrayArgs, _countof(DynamicIndexingVectorToArrayArgs));
@@ -328,6 +338,7 @@ static bool IsPassOptionName(StringRef S) {
     ||  S.equals("TIRA")
     ||  S.equals("TLIImpl")
     ||  S.equals("Threshold")
+    ||  S.equals("UAVSize")
     ||  S.equals("add-pixel-cost")
     ||  S.equals("bonus-inst-threshold")
     ||  S.equals("constant-alpha")
@@ -356,6 +367,9 @@ static bool IsPassOptionName(StringRef S) {
     ||  S.equals("no-discriminators")
     ||  S.equals("noloads")
     ||  S.equals("num-pixels")
+    ||  S.equals("parameter0")
+    ||  S.equals("parameter1")
+    ||  S.equals("parameter2")
     ||  S.equals("pragma-unroll-threshold")
     ||  S.equals("reroll-num-tolerated-failed-matches")
     ||  S.equals("rewrite-map-file")
@@ -554,22 +568,35 @@ HRESULT STDMETHODCALLTYPE DxcOptimizer::RunOptimizer(
   DxcThreadMalloc TM(m_pMalloc);
 
   // Setup input buffer.
+  //
   // The ir parsing requires the buffer to be null terminated. We deal with
   // both source and bitcode input, so the input buffer may not be null
-  // terminated.
-  // Create a new membuf that copies the buffer and adds a null terminator.
-  StringRef bufStrRef(reinterpret_cast<const char *>(pBlob->GetBufferPointer()),
-                      pBlob->GetBufferSize());
-  std::unique_ptr<MemoryBuffer> memBuf =
-      MemoryBuffer::getMemBufferCopy(bufStrRef);
-
-  // Parse IR
+  // terminated; we create a new membuf that copies and appends for this.
+  //
+  // If we have the beginning of a DXIL program header, skip to the bitcode.
+  //
   LLVMContext Context;
   SMDiagnostic Err;
-  std::unique_ptr<Module> M = parseIR(memBuf->getMemBufferRef(), Err, Context);
-  if (!M) {
-    //Err.print(argv[0], errs());
-    return E_INVALIDARG;
+  std::unique_ptr<MemoryBuffer> memBuf;
+  std::unique_ptr<Module> M;
+  const char * pBlobContent = reinterpret_cast<const char *>(pBlob->GetBufferPointer());
+  unsigned blobSize = pBlob->GetBufferSize();
+  const DxilProgramHeader *pProgramHeader =
+    reinterpret_cast<const DxilProgramHeader *>(pBlobContent);
+  if (IsValidDxilProgramHeader(pProgramHeader, blobSize)) {
+    std::string DiagStr;
+    GetDxilProgramBitcode(pProgramHeader, &pBlobContent, &blobSize);
+    M = hlsl::dxilutil::LoadModuleFromBitcode(
+      llvm::StringRef(pBlobContent, blobSize), Context, DiagStr);
+  }
+  else {
+    StringRef bufStrRef(pBlobContent, blobSize);
+    memBuf = MemoryBuffer::getMemBufferCopy(bufStrRef);
+    M = parseIR(memBuf->getMemBufferRef(), Err, Context);
+  }
+
+  if (M == nullptr) {
+    return DXC_E_IR_VERIFICATION_FAILED;
   }
 
   legacy::PassManager ModulePasses;

@@ -10,6 +10,7 @@ add_llvm_library(LLVMHLSL
   DxilContainer.cpp
   DxilContainerAssembler.cpp
   DxilContainerReflection.cpp
+  DxilDebugInstrumentation.cpp
   DxilEliminateOutputDynamicIndexing.cpp
   DxilExpandTrigIntrinsics.cpp
   DxilForceEarlyZ.cpp
@@ -46,6 +47,7 @@ add_llvm_library(LLVMHLSL
   HLOperationLowerExtension.cpp
   HLResource.cpp
   HLSignatureLower.cpp
+  PauseResumePasses.cpp
   ReducibilityAnalysis.cpp
   WaveSensitivityAnalysis.cpp
 

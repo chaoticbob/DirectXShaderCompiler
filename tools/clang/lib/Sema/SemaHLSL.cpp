@@ -9415,6 +9415,10 @@ bool FlattenedTypeIterator::pushTrackerForType(QualType type, MultiExprArg::iter
     return false;
   }
 
+  if (type->isFunctionType()) {
+    return false;
+  }
+
   if (m_firstType.isNull()) {
     m_firstType = type;
   }
@@ -10173,6 +10177,10 @@ void hlsl::HandleDeclAttributeForHLSL(Sema &S, Decl *D, const AttributeList &A, 
     declAttr = ::new (S.Context) VKBindingAttr(A.getRange(), S.Context,
       ValidateAttributeIntArg(S, A), ValidateAttributeIntArg(S, A, 1),
       A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_VKCounterBinding:
+    declAttr = ::new (S.Context) VKCounterBindingAttr(A.getRange(), S.Context,
+      ValidateAttributeIntArg(S, A), A.getAttributeSpellingListIndex());
     break;
   default:
     Handled = false;

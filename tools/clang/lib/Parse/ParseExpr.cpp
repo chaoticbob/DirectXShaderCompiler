@@ -461,6 +461,9 @@ Parser::ParseRHSOfBinaryExpression(ExprResult LHS, prec::Level MinPrec) {
     } else
       // Ensure potential typos in the RHS aren't left undiagnosed.
       Actions.CorrectDelayedTyposInExpr(RHS);
+      // HLSL Change Begin - Take care TernaryMiddle.
+      Actions.CorrectDelayedTyposInExpr(TernaryMiddle);
+      // HLSL Change End.
   }
 }
 

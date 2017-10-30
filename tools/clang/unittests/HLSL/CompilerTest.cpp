@@ -48,6 +48,14 @@
 using namespace std;
 using namespace hlsl_test;
 
+void AssembleToContainer(dxc::DxcDllSupport &dllSupport, IDxcBlob *pModule, IDxcBlob **pContainer) {
+  CComPtr<IDxcAssembler> pAssembler;
+  CComPtr<IDxcOperationResult> pResult;
+  VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcAssembler, &pAssembler));
+  VERIFY_SUCCEEDED(pAssembler->AssembleToContainer(pModule, &pResult));
+  CheckOperationSucceeded(pResult, pContainer);
+}
+
 std::wstring BlobToUtf16(_In_ IDxcBlob *pBlob) {
   CComPtr<IDxcBlobEncoding> pBlobEncoding;
   const UINT CP_UTF16 = 1200;
@@ -68,6 +76,16 @@ std::wstring BlobToUtf16(_In_ IDxcBlob *pBlob) {
   } else {
     throw std::exception("Unsupported codepage.");
   }
+}
+
+void GetDxilPart(dxc::DxcDllSupport &dllSupport, IDxcBlob *pProgram, IDxcBlob **pDxilPart) {
+  const UINT32 DxilPartKind = 'LIXD'; // DXIL
+  UINT32 DxilIndex;
+  CComPtr<IDxcContainerReflection> pContainerReflection;
+  VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcContainerReflection, &pContainerReflection));
+  VERIFY_SUCCEEDED(pContainerReflection->Load(pProgram));
+  VERIFY_SUCCEEDED(pContainerReflection->FindFirstPartKind(DxilPartKind, &DxilIndex));
+  VERIFY_SUCCEEDED(pContainerReflection->GetPartContent(DxilIndex, pDxilPart));
 }
 
 void Utf8ToBlob(dxc::DxcDllSupport &dllSupport, const char *pVal, _Outptr_ IDxcBlobEncoding **ppBlob) {
@@ -430,6 +448,15 @@ public:
   TEST_METHOD(PixConstantColorFromCB)
   TEST_METHOD(PixConstantColorFromCBint)
   TEST_METHOD(PixForceEarlyZ)
+  TEST_METHOD(PixDebugBasic)
+  TEST_METHOD(PixDebugUAVSize)
+  TEST_METHOD(PixDebugPSParameters)
+  TEST_METHOD(PixDebugVSParameters)
+  TEST_METHOD(PixDebugCSParameters)
+  TEST_METHOD(PixDebugFlowControl)
+  TEST_METHOD(PixDebugPreexistingSVPosition)
+  TEST_METHOD(PixDebugPreexistingSVVertex)
+  TEST_METHOD(PixDebugPreexistingSVInstance)
 
   TEST_METHOD(CodeGenAbs1)
   TEST_METHOD(CodeGenAbs2)
@@ -479,6 +506,7 @@ public:
   TEST_METHOD(CodeGenCbufferAlloc)
   TEST_METHOD(CodeGenCbufferAllocLegacy)
   TEST_METHOD(CodeGenCbufferHalf)
+  TEST_METHOD(CodeGenCbufferHalfStruct)
   TEST_METHOD(CodeGenCbufferInLoop)
   TEST_METHOD(CodeGenCbufferMinPrec)
   TEST_METHOD(CodeGenClass)
@@ -489,6 +517,9 @@ public:
   TEST_METHOD(CodeGenConstMat2)
   TEST_METHOD(CodeGenConstMat3)
   TEST_METHOD(CodeGenConstMat4)
+  TEST_METHOD(CodeGenCorrectDelay)
+  TEST_METHOD(CodeGenDataLayout)
+  TEST_METHOD(CodeGenDataLayoutHalf)
   TEST_METHOD(CodeGenDiscard)
   TEST_METHOD(CodeGenDivZero)
   TEST_METHOD(CodeGenDot1)
@@ -563,7 +594,9 @@ public:
   TEST_METHOD(CodeGenInput2)
   TEST_METHOD(CodeGenInput3)
   TEST_METHOD(CodeGenIntrinsic1)
+  TEST_METHOD(CodeGenIntrinsic1Minprec)
   TEST_METHOD(CodeGenIntrinsic2)
+  TEST_METHOD(CodeGenIntrinsic2Minprec)
   TEST_METHOD(CodeGenIntrinsic3_even)
   TEST_METHOD(CodeGenIntrinsic3_integer)
   TEST_METHOD(CodeGenIntrinsic3_odd)
@@ -571,6 +604,7 @@ public:
   TEST_METHOD(CodeGenIntrinsic4)
   TEST_METHOD(CodeGenIntrinsic4_dbg)
   TEST_METHOD(CodeGenIntrinsic5)
+  TEST_METHOD(CodeGenIntrinsic5Minprec)
   TEST_METHOD(CodeGenInvalidInputOutputTypes)
   TEST_METHOD(CodeGenLegacyStruct)
   TEST_METHOD(CodeGenLibCsEntry)
@@ -626,8 +660,10 @@ public:
   TEST_METHOD(CodeGenMinprec5)
   TEST_METHOD(CodeGenMinprec6)
   TEST_METHOD(CodeGenMinprec7)
+  TEST_METHOD(CodeGenMinprecCoord)
   TEST_METHOD(CodeGenModf)
   TEST_METHOD(CodeGenMinprecCast)
+  TEST_METHOD(CodeGenMinprecImm)
   TEST_METHOD(CodeGenMultiUAVLoad1)
   TEST_METHOD(CodeGenMultiUAVLoad2)
   TEST_METHOD(CodeGenMultiUAVLoad3)
@@ -736,10 +772,12 @@ public:
   TEST_METHOD(CodeGenStaticGlobals2)
   TEST_METHOD(CodeGenStaticGlobals3)
   TEST_METHOD(CodeGenStaticGlobals4)
+  TEST_METHOD(CodeGenStaticGlobals5)
   TEST_METHOD(CodeGenStaticMatrix)
   TEST_METHOD(CodeGenStaticResource)
   TEST_METHOD(CodeGenStaticResource2)
   TEST_METHOD(CodeGenStruct_Buf1)
+  TEST_METHOD(CodeGenStruct_Buf_New_Layout)
   TEST_METHOD(CodeGenStruct_BufHasCounter)
   TEST_METHOD(CodeGenStruct_BufHasCounter2)
   TEST_METHOD(CodeGenStructArray)
@@ -788,6 +826,7 @@ public:
   TEST_METHOD(CodeGenWriteToInput)
   TEST_METHOD(CodeGenWriteToInput2)
   TEST_METHOD(CodeGenWriteToInput3)
+  TEST_METHOD(CodeGenWriteToInput4)
 
   TEST_METHOD(CodeGenAttributes_Mod)
   TEST_METHOD(CodeGenConst_Exprb_Mod)
@@ -803,6 +842,7 @@ public:
   //TEST_METHOD(CodeGenMore_Operators_Mod)
   //TEST_METHOD(CodeGenObject_Operators_Mod)
   TEST_METHOD(CodeGenPackreg_Mod)
+  TEST_METHOD(CodeGenParentMethod)
   TEST_METHOD(CodeGenParameter_Types)
   TEST_METHOD(CodeGenScalar_Assignments_Mod)
   TEST_METHOD(CodeGenScalar_Operators_Assign_Mod)
@@ -815,6 +855,7 @@ public:
   TEST_METHOD(CodeGenTemplate_Checks_Mod)
   TEST_METHOD(CodeGenToinclude2_Mod)
   TEST_METHOD(CodeGenTypemods_Syntax_Mod)
+  TEST_METHOD(CodeGenTypedBufferHalf)
   TEST_METHOD(CodeGenVarmods_Syntax_Mod)
   TEST_METHOD(CodeGenVector_Assignments_Mod)
   TEST_METHOD(CodeGenVector_Syntax_Mix_Mod)
@@ -2295,29 +2336,7 @@ TEST_F(CompilerTest, CompileWhenODumpThenOptimizerMatch) {
     // Get wchar_t version and prepend hlsl-hlensure, to do a split high-level/opt compilation pass.
     CA2W passesW(passes.c_str(), CP_UTF8);
     std::vector<LPCWSTR> Options;
-    Options.push_back(L"-hlsl-hlensure");
-    wchar_t *pPassesBuffer = passesW.m_psz;
-    while (*pPassesBuffer) {
-      // Skip comment lines.
-      if (*pPassesBuffer == L'#') {
-        while (*pPassesBuffer && *pPassesBuffer != '\n' && *pPassesBuffer != '\r') {
-          ++pPassesBuffer;
-        }
-        while (*pPassesBuffer == '\n' || *pPassesBuffer == '\r') {
-          ++pPassesBuffer;
-        }
-        continue;
-      }
-      // Every other line is an option. Find the end of the line/buffer and terminate it.
-      Options.push_back(pPassesBuffer);
-      while (*pPassesBuffer && *pPassesBuffer != '\n' && *pPassesBuffer != '\r') {
-        ++pPassesBuffer;
-      }
-      while (*pPassesBuffer == '\n' || *pPassesBuffer == '\r') {
-        *pPassesBuffer = L'\0';
-        ++pPassesBuffer;
-      }
-    }
+    SplitPassList(passesW.m_psz, Options);
 
     // Now compile directly.
     pResult.Release();
@@ -2335,6 +2354,9 @@ TEST_F(CompilerTest, CompileWhenODumpThenOptimizerMatch) {
     VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(pHighLevelBlob, Options.data(),
                                               Options.size(), &pOptimizedModule,
                                               nullptr));
+
+    string text = DisassembleProgram(m_dllSupport, pOptimizedModule);
+    LogCommentFmt(L"Final program:\r\n%S", text.c_str());
 
     // At the very least, the module should be valid.
     pResult.Release();
@@ -2865,6 +2887,42 @@ TEST_F(CompilerTest, PixForceEarlyZ) {
   CodeGenTestCheck(L"pix\\forceEarlyZ.hlsl");
 }
 
+TEST_F(CompilerTest, PixDebugBasic) {
+  CodeGenTestCheck(L"pix\\DebugBasic.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugUAVSize) {
+  CodeGenTestCheck(L"pix\\DebugUAVSize.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugPSParameters) {
+  CodeGenTestCheck(L"pix\\DebugPSParameters.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugVSParameters) {
+  CodeGenTestCheck(L"pix\\DebugVSParameters.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugCSParameters) {
+  CodeGenTestCheck(L"pix\\DebugCSParameters.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugFlowControl) {
+  CodeGenTestCheck(L"pix\\DebugFlowControl.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugPreexistingSVPosition) {
+  CodeGenTestCheck(L"pix\\DebugPreexistingSVPosition.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugPreexistingSVVertex) {
+  CodeGenTestCheck(L"pix\\DebugPreexistingSVVertex.hlsl");
+}
+
+TEST_F(CompilerTest, PixDebugPreexistingSVInstance) {
+  CodeGenTestCheck(L"pix\\DebugPreexistingSVInstance.hlsl");
+}
+
 TEST_F(CompilerTest, CodeGenAbs1) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\abs1.hlsl");
 }
@@ -3062,6 +3120,11 @@ TEST_F(CompilerTest, CodeGenCbufferHalf) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\cbufferHalf.hlsl");
 }
 
+TEST_F(CompilerTest, CodeGenCbufferHalfStruct) {
+  if (m_ver.SkipDxilVersion(1, 2)) return;
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\cbufferHalf-struct.hlsl");
+}
+
 TEST_F(CompilerTest, CodeGenCbufferInLoop) {
   CodeGenTest(L"..\\CodeGenHLSL\\cbufferInLoop.hlsl");
 }
@@ -3100,6 +3163,19 @@ TEST_F(CompilerTest, CodeGenConstMat3) {
 
 TEST_F(CompilerTest, CodeGenConstMat4) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\constMat4.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenCorrectDelay) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\correct_delay.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenDataLayout) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\dataLayout.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenDataLayoutHalf) {
+  if (m_ver.SkipDxilVersion(1, 2)) return;
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\dataLayoutHalf.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenDiscard) {
@@ -3396,8 +3472,16 @@ TEST_F(CompilerTest, CodeGenIntrinsic1) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\intrinsic1.hlsl");
 }
 
+TEST_F(CompilerTest, CodeGenIntrinsic1Minprec) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\intrinsic1_minprec.hlsl");
+}
+
 TEST_F(CompilerTest, CodeGenIntrinsic2) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\intrinsic2.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenIntrinsic2Minprec) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\intrinsic2_minprec.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenIntrinsic3_even) {
@@ -3426,6 +3510,10 @@ TEST_F(CompilerTest, CodeGenIntrinsic4_dbg) {
 
 TEST_F(CompilerTest, CodeGenIntrinsic5) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\intrinsic5.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenIntrinsic5Minprec) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\intrinsic5_minprec.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenInvalidInputOutputTypes) {
@@ -3651,12 +3739,20 @@ TEST_F(CompilerTest, CodeGenMinprec7) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\minprec7.hlsl");
 }
 
+TEST_F(CompilerTest, CodeGenMinprecCoord) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\minprec_coord.hlsl");
+}
+
 TEST_F(CompilerTest, CodeGenModf) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\modf.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenMinprecCast) {
   CodeGenTest(L"..\\CodeGenHLSL\\minprec_cast.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenMinprecImm) {
+  CodeGenTest(L"..\\CodeGenHLSL\\minprec_imm.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenMultiUAVLoad1) {
@@ -4103,6 +4199,10 @@ TEST_F(CompilerTest, CodeGenStaticGlobals4) {
   CodeGenTest(L"..\\CodeGenHLSL\\staticGlobals4.hlsl");
 }
 
+TEST_F(CompilerTest, CodeGenStaticGlobals5) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\staticGlobals5.hlsl");
+}
+
 TEST_F(CompilerTest, CodeGenStaticMatrix) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\static_matrix.hlsl");
 }
@@ -4117,6 +4217,11 @@ TEST_F(CompilerTest, CodeGenStaticResource2) {
 
 TEST_F(CompilerTest, CodeGenStruct_Buf1) {
   CodeGenTest(L"..\\CodeGenHLSL\\struct_buf1.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenStruct_Buf_New_Layout) {
+  if (m_ver.SkipDxilVersion(1, 2)) return;
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\struct_buf_new_layout.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenStruct_BufHasCounter) {
@@ -4312,6 +4417,10 @@ TEST_F(CompilerTest, CodeGenWriteToInput3) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\writeToInput3.hlsl");
 }
 
+TEST_F(CompilerTest, CodeGenWriteToInput4) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\writeToInput4.hlsl");
+}
+
 TEST_F(CompilerTest, CodeGenAttributes_Mod) {
   CodeGenTest(L"..\\CodeGenHLSL\\attributes_Mod.hlsl");
 }
@@ -4370,6 +4479,10 @@ TEST_F(CompilerTest, CodeGenPackreg_Mod) {
   CodeGenTest(L"..\\CodeGenHLSL\\packreg_Mod.hlsl");
 }
 
+TEST_F(CompilerTest, CodeGenParentMethod) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\parent_method.hlsl");
+}
+
 TEST_F(CompilerTest, CodeGenParameter_Types) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\parameter_types.hlsl");
 }
@@ -4416,6 +4529,11 @@ TEST_F(CompilerTest, CodeGenToinclude2_Mod) {
 
 TEST_F(CompilerTest, CodeGenTypemods_Syntax_Mod) {
   CodeGenTest(L"..\\CodeGenHLSL\\typemods-syntax_Mod.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenTypedBufferHalf) {
+  if (m_ver.SkipDxilVersion(1, 2)) return;
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\typed_buffer_half.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenVarmods_Syntax_Mod) {

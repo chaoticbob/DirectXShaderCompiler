@@ -144,13 +144,27 @@ public:
   uint32_t createBinaryOp(spv::Op op, uint32_t resultType, uint32_t lhs,
                           uint32_t rhs);
 
-  /// \brief Creates an OpAtomicIAdd or OpAtomicISub instruction with the given
-  /// parameters. Returns the <result-id> for the result.
-  uint32_t createAtomicIAddSub(uint32_t resultType, uint32_t orignalValuePtr,
-                               uint32_t scopeId, uint32_t memorySemanticsId,
-                               uint32_t valueToOp, bool isAdd);
+  /// \brief Creates an atomic instruction with the given parameters.
+  /// Returns the <result-id> for the result.
+  uint32_t createAtomicOp(spv::Op opcode, uint32_t resultType,
+                          uint32_t orignalValuePtr, uint32_t scopeId,
+                          uint32_t memorySemanticsId, uint32_t valueToOp);
+  uint32_t createAtomicCompareExchange(uint32_t resultType,
+                                       uint32_t orignalValuePtr,
+                                       uint32_t scopeId,
+                                       uint32_t equalMemorySemanticsId,
+                                       uint32_t unequalMemorySemanticsId,
+                                       uint32_t valueToOp, uint32_t comparator);
+
+  /// \brief Creates an OpImageTexelPointer SPIR-V instruction with the given
+  /// parameters.
+  uint32_t createImageTexelPointer(uint32_t resultType, uint32_t imageId,
+                                   uint32_t coordinate, uint32_t sample);
 
   /// \brief Creates SPIR-V instructions for sampling the given image.
+  ///
+  /// If compareVal is given a non-zero value, *Dref* variants of OpImageSample*
+  /// will be generated.
   ///
   /// If lod or grad is given a non-zero value, *ExplicitLod variants of
   /// OpImageSample* will be generated; otherwise, *ImplicitLod variant will
@@ -161,7 +175,8 @@ public:
   /// respectively.
   uint32_t createImageSample(uint32_t texelType, uint32_t imageType,
                              uint32_t image, uint32_t sampler,
-                             uint32_t coordinate, uint32_t bias, uint32_t lod,
+                             uint32_t coordinate, uint32_t bias,
+                             uint32_t compareVal, uint32_t lod,
                              std::pair<uint32_t, uint32_t> grad,
                              uint32_t constOffset, uint32_t varOffset,
                              uint32_t constOffsets, uint32_t sample);
@@ -179,12 +194,16 @@ public:
   /// \brief Creates SPIR-V instructions for writing to the given image.
   void createImageWrite(uint32_t imageId, uint32_t coordId, uint32_t texelId);
 
-  /// \brief Creates SPIR-V instructions for sampling the given image.
+  /// \brief Creates SPIR-V instructions for gathering the given image.
+  ///
+  /// If compareVal is given a non-zero value, OpImageDrefGather will be
+  /// generated; otherwise, OpImageGather will be generated.
   uint32_t createImageGather(uint32_t texelType, uint32_t imageType,
                              uint32_t image, uint32_t sampler,
                              uint32_t coordinate, uint32_t component,
-                             uint32_t constOffset, uint32_t varOffset,
-                             uint32_t constOffsets, uint32_t sample);
+                             uint32_t compareVal, uint32_t constOffset,
+                             uint32_t varOffset, uint32_t constOffsets,
+                             uint32_t sample);
 
   /// \brief Creates a select operation with the given values for true and false
   /// cases and returns the <result-id> for the result.
@@ -231,6 +250,9 @@ public:
   /// instruction.
   uint32_t createExtInst(uint32_t resultType, uint32_t setId, uint32_t instId,
                          llvm::ArrayRef<uint32_t> operands);
+
+  /// \brief Creates an OpControlBarrier instruction with the given flags.
+  void createControlBarrier(uint32_t exec, uint32_t memory, uint32_t semantics);
 
   // === SPIR-V Module Structure ===
 
@@ -322,6 +344,7 @@ public:
   uint32_t getConstantInt32(int32_t value);
   uint32_t getConstantUint32(uint32_t value);
   uint32_t getConstantFloat32(float value);
+  uint32_t getConstantFloat64(double value);
   uint32_t getConstantComposite(uint32_t typeId,
                                 llvm::ArrayRef<uint32_t> constituents);
   uint32_t getConstantNull(uint32_t type);

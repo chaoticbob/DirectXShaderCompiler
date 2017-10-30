@@ -54,7 +54,7 @@ float4 main(float4 arg : A) : SV_TARGET {
 
   float4 ff = faceforward(n, i, ng);
   double ma = fma(a, b, c);
-  float st = step(y, x);
+  float st = step(y, x) + smoothstep(y, x, 0.3);
   float4 ref = refract(i, n, eta);
   float fmad = mad(x,y,z);
   int   ima = mad(ix,iy,iz);

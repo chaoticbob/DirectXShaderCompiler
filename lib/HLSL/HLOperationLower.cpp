@@ -38,13 +38,16 @@ struct HLOperationLowerHelper {
   DxilTypeSystem &dxilTypeSys;
   DxilFunctionProps *functionProps;
   bool bLegacyCBufferLoad;
+  bool bNewDataLayout;
   DataLayout legacyDataLayout;
+  DataLayout newDataLayout;
   HLOperationLowerHelper(HLModule &HLM);
 };
 
 HLOperationLowerHelper::HLOperationLowerHelper(HLModule &HLM)
     : hlslOP(*HLM.GetOP()), dxilTypeSys(HLM.GetTypeSystem()),
-      legacyDataLayout(HLModule::GetLegacyDataLayoutDesc()) {
+      legacyDataLayout(hlsl::DXIL::kLegacyLayoutString),
+      newDataLayout(hlsl::DXIL::kNewLayoutString) {
   llvm::LLVMContext &Ctx = HLM.GetCtx();
   voidTy = Type::getVoidTy(Ctx);
   f32Ty = Type::getFloatTy(Ctx);
@@ -56,6 +59,7 @@ HLOperationLowerHelper::HLOperationLowerHelper(HLModule &HLM)
   if (HLM.HasDxilFunctionProps(EntryFunc))
     functionProps = &HLM.GetDxilFunctionProps(EntryFunc);
   bLegacyCBufferLoad = HLM.GetHLOptions().bLegacyCBufferLoad;
+  bNewDataLayout = !HLM.GetHLOptions().bUseMinPrecision;
 }
 
 struct HLObjectOperationLowerHelper {
@@ -1898,8 +1902,8 @@ Value *TranslateRefract(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
   Value *eta2 = Builder.CreateFMul(eta, eta);
   // d*d;
   Value *dot2 = Builder.CreateFMul(dot, dot);
-  Constant *one = hlslOP->GetFloatConst(1);
-  Constant *zero = hlslOP->GetFloatConst(0);
+  Constant *one = ConstantFP::get(eta->getType(), 1);
+  Constant *zero = ConstantFP::get(eta->getType(), 0);
   // 1- d*d;
   dot2 = Builder.CreateFSub(one, dot2);
   // eta * eta * (1-d*d);
@@ -1944,8 +1948,8 @@ Value *TranslateSmoothStep(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   Value *s = TrivialDxilUnaryOperation(DXIL::OpCode::Saturate, satVal, hlslOP,
                                        Builder);
   // return s * s *(3-2*s).
-  Constant *c2 = hlslOP->GetFloatConst(2);
-  Constant *c3 = hlslOP->GetFloatConst(3);
+  Constant *c2 = ConstantFP::get(CI->getType(),2);
+  Constant *c3 = ConstantFP::get(CI->getType(),3);
   if (s->getType()->isVectorTy()) {
     unsigned vecSize = s->getType()->getVectorNumElements();
     c2 = ConstantVector::getSplat(vecSize, c2);
@@ -2186,7 +2190,7 @@ Value *TranslateGetDimensions(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 
   Value *width = Builder.CreateExtractValue(dims, dimensionIdx++);
   Value *widthPtr = CI->getArgOperand(widthOpIdx);
-  if (widthPtr->getType()->getPointerElementType()->isFloatTy())
+  if (widthPtr->getType()->getPointerElementType()->isFloatingPointTy())
     width = Builder.CreateSIToFP(width,
                                  widthPtr->getType()->getPointerElementType());
 
@@ -2210,7 +2214,7 @@ Value *TranslateGetDimensions(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
            argIdx < CI->getNumArgOperands() - 1; argIdx++) {
         Value *dim = Builder.CreateExtractValue(dims, dimensionIdx++);
         Value *ptr = CI->getArgOperand(argIdx);
-        if (ptr->getType()->getPointerElementType()->isFloatTy())
+        if (ptr->getType()->getPointerElementType()->isFloatingPointTy())
           dim = Builder.CreateSIToFP(dim,
                                      ptr->getType()->getPointerElementType());
         Builder.CreateStore(dim, ptr);
@@ -2219,7 +2223,7 @@ Value *TranslateGetDimensions(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
       dimensionIdx = 3;
       Value *dim = Builder.CreateExtractValue(dims, dimensionIdx);
       Value *ptr = CI->getArgOperand(CI->getNumArgOperands() - 1);
-      if (ptr->getType()->getPointerElementType()->isFloatTy())
+      if (ptr->getType()->getPointerElementType()->isFloatingPointTy())
         dim =
             Builder.CreateSIToFP(dim, ptr->getType()->getPointerElementType());
       Builder.CreateStore(dim, ptr);
@@ -2228,7 +2232,7 @@ Value *TranslateGetDimensions(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
            argIdx++) {
         Value *dim = Builder.CreateExtractValue(dims, dimensionIdx++);
         Value *ptr = CI->getArgOperand(argIdx);
-        if (ptr->getType()->getPointerElementType()->isFloatTy())
+        if (ptr->getType()->getPointerElementType()->isFloatingPointTy())
           dim = Builder.CreateSIToFP(dim,
                                      ptr->getType()->getPointerElementType());
         Builder.CreateStore(dim, ptr);
@@ -6301,11 +6305,11 @@ void TranslateHLSubscript(CallInst *CI, HLSubscriptOpcode opcode,
       Type *RetTy = ObjTy->getStructElementType(0);
       if (RK == DxilResource::Kind::StructuredBuffer) {
         TranslateStructBufSubscript(CI, handle, /*status*/ nullptr, hlslOP,
-                                    helper.legacyDataLayout);
+                                    helper.bNewDataLayout ? helper.newDataLayout : helper.legacyDataLayout);
       } else if (RetTy->isAggregateType() &&
                  RK == DxilResource::Kind::TypedBuffer) {
         TranslateStructBufSubscript(CI, handle, /*status*/ nullptr, hlslOP,
-                                    helper.legacyDataLayout);
+                                    helper.bNewDataLayout ? helper.newDataLayout : helper.legacyDataLayout);
         // Clear offset for typed buf.
         for (auto User : handle->users()) {
           CallInst *CI = cast<CallInst>(User);

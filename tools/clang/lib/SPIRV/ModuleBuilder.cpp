@@ -210,19 +210,71 @@ uint32_t ModuleBuilder::createBinaryOp(spv::Op op, uint32_t resultType,
   return id;
 }
 
-uint32_t ModuleBuilder::createAtomicIAddSub(uint32_t resultType,
-                                            uint32_t orignalValuePtr,
-                                            uint32_t scopeId,
-                                            uint32_t memorySemanticsId,
-                                            uint32_t valueToOp, bool isAdd) {
+uint32_t ModuleBuilder::createAtomicOp(spv::Op opcode, uint32_t resultType,
+                                       uint32_t orignalValuePtr,
+                                       uint32_t scopeId,
+                                       uint32_t memorySemanticsId,
+                                       uint32_t valueToOp) {
   assert(insertPoint && "null insert point");
   const uint32_t id = theContext.takeNextId();
-  if (isAdd)
+  switch (opcode) {
+  case spv::Op::OpAtomicIAdd:
     instBuilder.opAtomicIAdd(resultType, id, orignalValuePtr, scopeId,
                              memorySemanticsId, valueToOp);
-  else
+    break;
+  case spv::Op::OpAtomicISub:
     instBuilder.opAtomicISub(resultType, id, orignalValuePtr, scopeId,
                              memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicAnd:
+    instBuilder.opAtomicAnd(resultType, id, orignalValuePtr, scopeId,
+                            memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicOr:
+    instBuilder.opAtomicOr(resultType, id, orignalValuePtr, scopeId,
+                           memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicXor:
+    instBuilder.opAtomicXor(resultType, id, orignalValuePtr, scopeId,
+                            memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicUMax:
+    instBuilder.opAtomicUMax(resultType, id, orignalValuePtr, scopeId,
+                             memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicUMin:
+    instBuilder.opAtomicUMin(resultType, id, orignalValuePtr, scopeId,
+                             memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicSMax:
+    instBuilder.opAtomicSMax(resultType, id, orignalValuePtr, scopeId,
+                             memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicSMin:
+    instBuilder.opAtomicSMin(resultType, id, orignalValuePtr, scopeId,
+                             memorySemanticsId, valueToOp);
+    break;
+  case spv::Op::OpAtomicExchange:
+    instBuilder.opAtomicExchange(resultType, id, orignalValuePtr, scopeId,
+                                 memorySemanticsId, valueToOp);
+    break;
+  default:
+    assert(false && "unimplemented atomic opcode");
+  }
+  instBuilder.x();
+  insertPoint->appendInstruction(std::move(constructSite));
+  return id;
+}
+
+uint32_t ModuleBuilder::createAtomicCompareExchange(
+    uint32_t resultType, uint32_t orignalValuePtr, uint32_t scopeId,
+    uint32_t equalMemorySemanticsId, uint32_t unequalMemorySemanticsId,
+    uint32_t valueToOp, uint32_t comparator) {
+  assert(insertPoint && "null insert point");
+  const uint32_t id = theContext.takeNextId();
+  instBuilder.opAtomicCompareExchange(
+      resultType, id, orignalValuePtr, scopeId, equalMemorySemanticsId,
+      unequalMemorySemanticsId, valueToOp, comparator);
   instBuilder.x();
   insertPoint->appendInstruction(std::move(constructSite));
   return id;
@@ -279,9 +331,21 @@ spv::ImageOperandsMask ModuleBuilder::composeImageOperandsMask(
   return mask;
 }
 
+uint32_t ModuleBuilder::createImageTexelPointer(uint32_t resultType,
+                                                uint32_t imageId,
+                                                uint32_t coordinate,
+                                                uint32_t sample) {
+  assert(insertPoint && "null insert point");
+  const uint32_t id = theContext.takeNextId();
+  instBuilder.opImageTexelPointer(resultType, id, imageId, coordinate, sample)
+      .x();
+  insertPoint->appendInstruction(std::move(constructSite));
+  return id;
+}
+
 uint32_t ModuleBuilder::createImageSample(
     uint32_t texelType, uint32_t imageType, uint32_t image, uint32_t sampler,
-    uint32_t coordinate, uint32_t bias, uint32_t lod,
+    uint32_t coordinate, uint32_t compareVal, uint32_t bias, uint32_t lod,
     std::pair<uint32_t, uint32_t> grad, uint32_t constOffset,
     uint32_t varOffset, uint32_t constOffsets, uint32_t sample) {
   assert(insertPoint && "null insert point");
@@ -296,15 +360,33 @@ uint32_t ModuleBuilder::createImageSample(
   llvm::SmallVector<uint32_t, 4> params;
   const auto mask = composeImageOperandsMask(
       bias, lod, grad, constOffset, varOffset, constOffsets, sample, &params);
-  // The Lod and Grad image operands requires explicit-lod instructions.
-  if (lod || (grad.first && grad.second)) {
-    instBuilder.opImageSampleExplicitLod(texelType, texelId, sampledImgId,
-                                         coordinate, mask);
+
+  // If depth-comparison is needed when sampling, we use the OpImageSampleDref*
+  // instructions.
+  if (compareVal) {
+    // The Lod and Grad image operands requires explicit-lod instructions.
+    // Otherwise we use implicit-lod instructions.
+    if (lod || (grad.first && grad.second)) {
+      instBuilder.opImageSampleDrefExplicitLod(texelType, texelId, sampledImgId,
+                                               coordinate, compareVal, mask);
+    } else {
+      instBuilder.opImageSampleDrefImplicitLod(
+          texelType, texelId, sampledImgId, coordinate, compareVal,
+          llvm::Optional<spv::ImageOperandsMask>(mask));
+    }
   } else {
-    instBuilder.opImageSampleImplicitLod(
-        texelType, texelId, sampledImgId, coordinate,
-        llvm::Optional<spv::ImageOperandsMask>(mask));
+    // The Lod and Grad image operands requires explicit-lod instructions.
+    // Otherwise we use implicit-lod instructions.
+    if (lod || (grad.first && grad.second)) {
+      instBuilder.opImageSampleExplicitLod(texelType, texelId, sampledImgId,
+                                           coordinate, mask);
+    } else {
+      instBuilder.opImageSampleImplicitLod(
+          texelType, texelId, sampledImgId, coordinate,
+          llvm::Optional<spv::ImageOperandsMask>(mask));
+    }
   }
+
   for (const auto param : params)
     instBuilder.idRef(param);
   instBuilder.x();
@@ -348,8 +430,9 @@ uint32_t ModuleBuilder::createImageFetchOrRead(
 
 uint32_t ModuleBuilder::createImageGather(
     uint32_t texelType, uint32_t imageType, uint32_t image, uint32_t sampler,
-    uint32_t coordinate, uint32_t component, uint32_t constOffset,
-    uint32_t varOffset, uint32_t constOffsets, uint32_t sample) {
+    uint32_t coordinate, uint32_t component, uint32_t compareVal,
+    uint32_t constOffset, uint32_t varOffset, uint32_t constOffsets,
+    uint32_t sample) {
   assert(insertPoint && "null insert point");
 
   // An OpSampledImage is required to do the image sampling.
@@ -365,8 +448,16 @@ uint32_t ModuleBuilder::createImageGather(
           /*bias*/ 0, /*lod*/ 0, std::make_pair(0, 0), constOffset, varOffset,
           constOffsets, sample, &params));
   const uint32_t texelId = theContext.takeNextId();
-  instBuilder.opImageGather(texelType, texelId, sampledImgId, coordinate,
-                            component, mask);
+
+  if (compareVal) {
+    // Note: OpImageDrefGather does not take the component parameter.
+    instBuilder.opImageDrefGather(texelType, texelId, sampledImgId, coordinate,
+                                  compareVal, mask);
+  } else {
+    instBuilder.opImageGather(texelType, texelId, sampledImgId, coordinate,
+                              component, mask);
+  }
+
   for (const auto param : params)
     instBuilder.idRef(param);
   instBuilder.x();
@@ -462,6 +553,13 @@ uint32_t ModuleBuilder::createExtInst(uint32_t resultType, uint32_t setId,
   return resultId;
 }
 
+void ModuleBuilder::createControlBarrier(uint32_t execution, uint32_t memory,
+                                         uint32_t semantics) {
+  assert(insertPoint && "null insert point");
+  instBuilder.opControlBarrier(execution, memory, semantics).x();
+  insertPoint->appendInstruction(std::move(constructSite));
+}
+
 void ModuleBuilder::addExecutionMode(uint32_t entryPointId,
                                      spv::ExecutionMode em,
                                      llvm::ArrayRef<uint32_t> params) {
@@ -555,6 +653,9 @@ void ModuleBuilder::decorate(uint32_t targetId, spv::Decoration decoration) {
     break;
   case spv::Decoration::RelaxedPrecision:
     d = Decoration::getRelaxedPrecision(theContext);
+    break;
+  case spv::Decoration::Patch:
+    d = Decoration::getPatch(theContext);
     break;
   }
 
@@ -841,6 +942,7 @@ uint32_t ModuleBuilder::getConstant##builderTy(cppTy value) {                  \
 IMPL_GET_PRIMITIVE_CONST(Int32, int32_t)
 IMPL_GET_PRIMITIVE_CONST(Uint32, uint32_t)
 IMPL_GET_PRIMITIVE_CONST(Float32, float)
+IMPL_GET_PRIMITIVE_CONST(Float64, double)
 
 #undef IMPL_GET_PRIMITIVE_VALUE
 

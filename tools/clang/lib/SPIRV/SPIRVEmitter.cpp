@@ -24,6 +24,31 @@ namespace spirv {
 
 namespace {
 
+// Returns true if the given decl has the given semantic.
+bool hasSemantic(const DeclaratorDecl *decl,
+                 hlsl::DXIL::SemanticKind semanticKind) {
+  using namespace hlsl;
+  for (auto *annotation : decl->getUnusualAnnotations()) {
+    if (auto *semanticDecl = dyn_cast<SemanticDecl>(annotation)) {
+      llvm::StringRef semanticName;
+      uint32_t semanticIndex = 0;
+      Semantic::DecomposeNameAndIndex(semanticDecl->SemanticName, &semanticName,
+                                      &semanticIndex);
+      const auto *semantic = Semantic::GetByName(semanticName);
+      if (semantic->GetKind() == semanticKind)
+        return true;
+    }
+  }
+  return false;
+}
+
+bool patchConstFuncTakesHullOutputPatch(FunctionDecl *pcf) {
+  for (const auto *param : pcf->parameters())
+    if (TypeTranslator::isOutputPatch(param->getType()))
+      return true;
+  return false;
+}
+
 // TODO: Maybe we should move these type probing functions to TypeTranslator.
 
 /// Returns true if the two types are the same scalar or vector type.
@@ -171,11 +196,52 @@ bool spirvToolsOptimize(std::vector<uint32_t> *module, std::string *messages) {
   optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
 
   optimizer.RegisterPass(spvtools::CreateEliminateDeadFunctionsPass());
+  optimizer.RegisterPass(spvtools::CreateCFGCleanupPass());
+  optimizer.RegisterPass(spvtools::CreateDeadVariableEliminationPass());
   optimizer.RegisterPass(spvtools::CreateEliminateDeadConstantPass());
 
   optimizer.RegisterPass(spvtools::CreateCompactIdsPass());
 
   return optimizer.Run(module->data(), module->size(), module);
+}
+
+/// Translates atomic HLSL opcodes into the equivalent SPIR-V opcode.
+spv::Op translateAtomicHlslOpcodeToSpirvOpcode(hlsl::IntrinsicOp opcode) {
+  using namespace hlsl;
+  using namespace spv;
+
+  switch (opcode) {
+  case IntrinsicOp::IOP_InterlockedAdd:
+  case IntrinsicOp::MOP_InterlockedAdd:
+    return Op::OpAtomicIAdd;
+  case IntrinsicOp::IOP_InterlockedAnd:
+  case IntrinsicOp::MOP_InterlockedAnd:
+    return Op::OpAtomicAnd;
+  case IntrinsicOp::IOP_InterlockedOr:
+  case IntrinsicOp::MOP_InterlockedOr:
+    return Op::OpAtomicOr;
+  case IntrinsicOp::IOP_InterlockedXor:
+  case IntrinsicOp::MOP_InterlockedXor:
+    return Op::OpAtomicXor;
+  case IntrinsicOp::IOP_InterlockedUMax:
+  case IntrinsicOp::MOP_InterlockedUMax:
+    return Op::OpAtomicUMax;
+  case IntrinsicOp::IOP_InterlockedUMin:
+  case IntrinsicOp::MOP_InterlockedUMin:
+    return Op::OpAtomicUMin;
+  case IntrinsicOp::IOP_InterlockedMax:
+  case IntrinsicOp::MOP_InterlockedMax:
+    return Op::OpAtomicSMax;
+  case IntrinsicOp::IOP_InterlockedMin:
+  case IntrinsicOp::MOP_InterlockedMin:
+    return Op::OpAtomicSMin;
+  case IntrinsicOp::IOP_InterlockedExchange:
+  case IntrinsicOp::MOP_InterlockedExchange:
+    return Op::OpAtomicExchange;
+  }
+
+  assert(false && "unimplemented hlsl intrinsic opcode");
+  return Op::Max;
 }
 
 } // namespace
@@ -200,12 +266,6 @@ void SPIRVEmitter::HandleTranslationUnit(ASTContext &context) {
   if (context.getDiagnostics().hasErrorOccurred())
     return;
 
-  AddRequiredCapabilitiesForShaderModel();
-
-  // Addressing and memory model are required in a valid SPIR-V module.
-  theBuilder.setAddressingModel(spv::AddressingModel::Logical);
-  theBuilder.setMemoryModel(spv::MemoryModel::GLSL450);
-
   TranslationUnitDecl *tu = context.getTranslationUnitDecl();
 
   // The entry function is the seed of the queue.
@@ -213,6 +273,9 @@ void SPIRVEmitter::HandleTranslationUnit(ASTContext &context) {
     if (auto *funcDecl = dyn_cast<FunctionDecl>(decl)) {
       if (funcDecl->getName() == entryFunctionName) {
         workQueue.insert(funcDecl);
+      }
+      if (context.IsPatchConstantFunctionDecl(funcDecl)) {
+        patchConstFunc = funcDecl;
       }
     } else if (auto *varDecl = dyn_cast<VarDecl>(decl)) {
       if (isa<HLSLBufferDecl>(varDecl->getDeclContext())) {
@@ -233,6 +296,15 @@ void SPIRVEmitter::HandleTranslationUnit(ASTContext &context) {
   for (uint32_t i = 0; i < workQueue.size(); ++i) {
     doDecl(workQueue[i]);
   }
+
+  if (context.getDiagnostics().hasErrorOccurred())
+    return;
+
+  AddRequiredCapabilitiesForShaderModel();
+
+  // Addressing and memory model are required in a valid SPIR-V module.
+  theBuilder.setAddressingModel(spv::AddressingModel::Logical);
+  theBuilder.setMemoryModel(spv::MemoryModel::GLSL450);
 
   theBuilder.addEntryPoint(getSpirvShaderStage(shaderModel), entryFunctionId,
                            entryFunctionName, declIdMapper.collectStageVars());
@@ -543,7 +615,7 @@ void SPIRVEmitter::doVarDecl(const VarDecl *decl) {
   // File scope variables (static "global" and "local" variables) belongs to
   // the Private storage class, while function scope variables (normal "local"
   // variables) belongs to the Function storage class.
-  if (!decl->isExternallyVisible()) {
+  if (!decl->isExternallyVisible() || decl->isStaticDataMember()) {
     // Note: cannot move varType outside of this scope because it generates
     // SPIR-V types without decorations, while external visible variable should
     // have SPIR-V type with decorations.
@@ -1027,10 +1099,25 @@ void SPIRVEmitter::doIfStmt(const IfStmt *ifStmt) {
 }
 
 void SPIRVEmitter::doReturnStmt(const ReturnStmt *stmt) {
-  if (const auto *retVal = stmt->getRetValue())
-    theBuilder.createReturnValue(doExpr(retVal));
-  else
+  if (const auto *retVal = stmt->getRetValue()) {
+    const auto retInfo = doExpr(retVal);
+    const auto retType = retVal->getType();
+    if (retInfo.storageClass != spv::StorageClass::Function &&
+        retType->isStructureType()) {
+      // We are returning some value from a non-Function storage class. Need to
+      // create a temporary variable to "convert" the value to Function storage
+      // class and then return.
+      const uint32_t valType = typeTranslator.translateType(retType);
+      const uint32_t tempVar = theBuilder.addFnVar(valType, "temp.var.ret");
+      storeValue(tempVar, retInfo, retType);
+
+      theBuilder.createReturnValue(theBuilder.createLoad(valType, tempVar));
+    } else {
+      theBuilder.createReturnValue(retInfo);
+    }
+  } else {
     theBuilder.createReturn();
+  }
 
   // Some statements that alter the control flow (break, continue, return, and
   // discard), require creation of a new basic block to hold any statement that
@@ -1117,10 +1204,12 @@ SPIRVEmitter::doArraySubscriptExpr(const ArraySubscriptExpr *expr) {
   const auto *base = collectArrayStructIndices(expr, &indices);
   auto info = doExpr(base);
 
-  const uint32_t ptrType = theBuilder.getPointerType(
-      typeTranslator.translateType(expr->getType(), info.layoutRule),
-      info.storageClass);
-  info.resultId = theBuilder.createAccessChain(ptrType, info, indices);
+  if (!indices.empty()) {
+    const uint32_t ptrType = theBuilder.getPointerType(
+        typeTranslator.translateType(expr->getType(), info.layoutRule),
+        info.storageClass);
+    info.resultId = theBuilder.createAccessChain(ptrType, info, indices);
+  }
 
   return info;
 }
@@ -1472,6 +1561,54 @@ uint32_t SPIRVEmitter::processByteAddressBufferStructuredBufferGetDimensions(
   return 0;
 }
 
+uint32_t SPIRVEmitter::processRWByteAddressBufferAtomicMethods(
+    hlsl::IntrinsicOp opcode, const CXXMemberCallExpr *expr) {
+  // The signature of RWByteAddressBuffer atomic methods are largely:
+  // void Interlocked*(in UINT dest, in UINT value);
+  // void Interlocked*(in UINT dest, in UINT value, out UINT original_value);
+
+  const auto *object = expr->getImplicitObjectArgument();
+  // We do not need to load the object since we are using its pointers.
+  const auto objectInfo = doExpr(object);
+
+  const auto uintType = theBuilder.getUint32Type();
+  const uint32_t zero = theBuilder.getConstantUint32(0);
+
+  const uint32_t offset = doExpr(expr->getArg(0));
+  // Right shift by 2 to convert the byte offset to uint32_t offset
+  const uint32_t address =
+      theBuilder.createBinaryOp(spv::Op::OpShiftRightLogical, uintType, offset,
+                                theBuilder.getConstantUint32(2));
+  const auto ptrType =
+      theBuilder.getPointerType(uintType, objectInfo.storageClass);
+  const uint32_t ptr =
+      theBuilder.createAccessChain(ptrType, objectInfo, {zero, address});
+
+  const uint32_t scope = theBuilder.getConstantUint32(1); // Device
+
+  const bool isCompareExchange =
+      opcode == hlsl::IntrinsicOp::MOP_InterlockedCompareExchange;
+  const bool isCompareStore =
+      opcode == hlsl::IntrinsicOp::MOP_InterlockedCompareStore;
+
+  if (isCompareExchange || isCompareStore) {
+    const uint32_t comparator = doExpr(expr->getArg(1));
+    const uint32_t originalVal = theBuilder.createAtomicCompareExchange(
+        uintType, ptr, scope, zero, zero, doExpr(expr->getArg(2)), comparator);
+    if (isCompareExchange)
+      theBuilder.createStore(doExpr(expr->getArg(3)), originalVal);
+  } else {
+    const uint32_t value = doExpr(expr->getArg(1));
+    const uint32_t originalVal = theBuilder.createAtomicOp(
+        translateAtomicHlslOpcodeToSpirvOpcode(opcode), uintType, ptr, scope,
+        zero, value);
+    if (expr->getNumArgs() > 2)
+      theBuilder.createStore(doExpr(expr->getArg(2)), originalVal);
+  }
+
+  return 0;
+}
+
 uint32_t
 SPIRVEmitter::processBufferTextureGetDimensions(const CXXMemberCallExpr *expr) {
   theBuilder.requireCapability(spv::Capability::ImageQuery);
@@ -1611,6 +1748,115 @@ SPIRVEmitter::processTextureLevelOfDetail(const CXXMemberCallExpr *expr) {
   // The first component of the float2 contains the mipmap array layer.
   return theBuilder.createCompositeExtract(theBuilder.getFloat32Type(), query,
                                            {0});
+}
+
+uint32_t SPIRVEmitter::processTextureGatherRGBACmpRGBA(
+    const CXXMemberCallExpr *expr, const bool isCmp, const uint32_t component) {
+  // Parameters for .Gather{Red|Green|Blue|Alpha}() are one of the following
+  // two sets:
+  // * SamplerState s, float2 location, int2 offset
+  // * SamplerState s, float2 location, int2 offset0, int2 offset1,
+  //   int offset2, int2 offset3
+  //
+  // An additional out uint status parameter can appear in both of the above,
+  // which we does not support yet.
+  //
+  // Parameters for .GatherCmp{Red|Green|Blue|Alpha}() are one of the following
+  // two sets:
+  // * SamplerState s, float2 location, int2 offset
+  // * SamplerState s, float2 location, int2 offset0, int2 offset1,
+  //   int offset2, int2 offset3
+  //
+  // An additional out uint status parameter can appear in both of the above,
+  // which we does not support yet.
+  //
+  // Return type is always a 4-component vector.
+  const FunctionDecl *callee = expr->getDirectCallee();
+  const auto numArgs = expr->getNumArgs();
+
+  if (numArgs != 3 + isCmp && numArgs != 6 + isCmp) {
+    emitError("unsupported '%0' method call with status parameter",
+              expr->getExprLoc())
+        << callee->getName() << expr->getSourceRange();
+    return 0;
+  }
+
+  const auto *imageExpr = expr->getImplicitObjectArgument();
+
+  const uint32_t image = loadIfGLValue(imageExpr);
+  const uint32_t sampler = doExpr(expr->getArg(0));
+  const uint32_t coordinate = doExpr(expr->getArg(1));
+  const uint32_t compareVal = isCmp ? doExpr(expr->getArg(2)) : 0;
+
+  uint32_t constOffset = 0, varOffset = 0, constOffsets = 0;
+  if (numArgs == 3 + isCmp) {
+    // One offset parameter
+    handleOptionalOffsetInMethodCall(expr, 2 + isCmp, &constOffset, &varOffset);
+  } else {
+    // Four offset parameters
+    const auto offset0 = tryToEvaluateAsConst(expr->getArg(2 + isCmp));
+    const auto offset1 = tryToEvaluateAsConst(expr->getArg(3 + isCmp));
+    const auto offset2 = tryToEvaluateAsConst(expr->getArg(4 + isCmp));
+    const auto offset3 = tryToEvaluateAsConst(expr->getArg(5 + isCmp));
+
+    // Make sure we can generate the ConstOffsets image operands in SPIR-V.
+    if (!offset0 || !offset1 || !offset2 || !offset3) {
+      emitError("all offset parameters to '%0' method call must be constants",
+                expr->getExprLoc())
+          << callee->getName() << expr->getSourceRange();
+      return 0;
+    }
+    const uint32_t v2i32 = theBuilder.getVecType(theBuilder.getInt32Type(), 2);
+    const uint32_t offsetType =
+        theBuilder.getArrayType(v2i32, theBuilder.getConstantUint32(4));
+    constOffsets = theBuilder.getConstantComposite(
+        offsetType, {offset0, offset1, offset2, offset3});
+  }
+
+  const auto retType = typeTranslator.translateType(callee->getReturnType());
+  const auto imageType = typeTranslator.translateType(imageExpr->getType());
+
+  return theBuilder.createImageGather(
+      retType, imageType, image, sampler, coordinate,
+      theBuilder.getConstantInt32(component), compareVal, constOffset,
+      varOffset, constOffsets, /*sampleNumber*/ 0);
+}
+
+uint32_t SPIRVEmitter::processTextureGatherCmp(const CXXMemberCallExpr *expr) {
+  // Signature:
+  //
+  // float4 GatherCmp(
+  //   in SamplerComparisonState s,
+  //   in float2 location,
+  //   in float compare_value
+  //   [,in int2 offset]
+  // );
+  const FunctionDecl *callee = expr->getDirectCallee();
+  const auto numArgs = expr->getNumArgs();
+
+  if (expr->getNumArgs() > 4) {
+    emitError("unsupported '%0' method call with status parameter",
+              expr->getExprLoc())
+        << callee->getName() << expr->getSourceRange();
+    return 0;
+  }
+
+  const auto *imageExpr = expr->getImplicitObjectArgument();
+
+  const uint32_t image = loadIfGLValue(imageExpr);
+  const uint32_t sampler = doExpr(expr->getArg(0));
+  const uint32_t coordinate = doExpr(expr->getArg(1));
+  const uint32_t comparator = doExpr(expr->getArg(2));
+  uint32_t constOffset = 0, varOffset = 0;
+  handleOptionalOffsetInMethodCall(expr, 3, &constOffset, &varOffset);
+
+  const auto retType = typeTranslator.translateType(callee->getReturnType());
+  const auto imageType = typeTranslator.translateType(imageExpr->getType());
+
+  return theBuilder.createImageGather(
+      retType, imageType, image, sampler, coordinate,
+      /*component*/ 0, comparator, constOffset, varOffset, /*constOffsets*/ 0,
+      /*sampleNumber*/ 0);
 }
 
 uint32_t SPIRVEmitter::processBufferTextureLoad(const Expr *object,
@@ -1794,36 +2040,49 @@ SPIRVEmitter::processStructuredBufferLoad(const CXXMemberCallExpr *expr) {
   return info;
 }
 
-SpirvEvalInfo
-SPIRVEmitter::processACSBufferAppendConsume(const CXXMemberCallExpr *expr) {
-  const bool isAppend = expr->getNumArgs() == 1;
-
-  const uint32_t u32Type = theBuilder.getUint32Type();
+uint32_t SPIRVEmitter::incDecRWACSBufferCounter(const CXXMemberCallExpr *expr,
+                                                bool isInc) {
+  const uint32_t i32Type = theBuilder.getInt32Type();
   const uint32_t one = theBuilder.getConstantUint32(1);  // As scope: Device
   const uint32_t zero = theBuilder.getConstantUint32(0); // As memory sema: None
+  const uint32_t sOne = theBuilder.getConstantInt32(1);
 
-  const auto *object = expr->getImplicitObjectArgument();
+  const auto *object =
+      expr->getImplicitObjectArgument()->IgnoreParenNoopCasts(astContext);
   const auto *buffer = cast<DeclRefExpr>(object)->getDecl();
 
-  // Calculate the index we should use for appending the value
-  const uint32_t counterVar = declIdMapper.getCounterId(cast<VarDecl>(buffer));
+  const uint32_t counterVar = declIdMapper.getOrCreateCounterId(buffer);
   const uint32_t counterPtrType = theBuilder.getPointerType(
       theBuilder.getInt32Type(), spv::StorageClass::Uniform);
   const uint32_t counterPtr =
       theBuilder.createAccessChain(counterPtrType, counterVar, {zero});
+
   uint32_t index = 0;
-  if (isAppend) {
-    // For append, we add one to the counter.
-    index = theBuilder.createAtomicIAddSub(u32Type, counterPtr, one, zero, one,
-                                           /*isAdd=*/true);
+  if (isInc) {
+    index = theBuilder.createAtomicOp(spv::Op::OpAtomicIAdd, i32Type,
+                                      counterPtr, one, zero, sOne);
   } else {
-    // For consume, we substract one from the counter. Note that OpAtomicIAdd
-    // returns the value before the addition; so we need to do substraction
-    // again with OpAtomicIAdd's return value.
-    const auto prevIndex = theBuilder.createAtomicIAddSub(
-        u32Type, counterPtr, one, zero, one, /*isAdd=*/false);
-    index = theBuilder.createBinaryOp(spv::Op::OpISub, u32Type, prevIndex, one);
+    // Note that OpAtomicISub returns the value before the subtraction;
+    // so we need to do substraction again with OpAtomicISub's return value.
+    const auto prev = theBuilder.createAtomicOp(spv::Op::OpAtomicISub, i32Type,
+                                                counterPtr, one, zero, sOne);
+    index = theBuilder.createBinaryOp(spv::Op::OpISub, i32Type, prev, sOne);
   }
+
+  return index;
+}
+
+SpirvEvalInfo
+SPIRVEmitter::processACSBufferAppendConsume(const CXXMemberCallExpr *expr) {
+  const bool isAppend = expr->getNumArgs() == 1;
+
+  const uint32_t zero = theBuilder.getConstantUint32(0);
+
+  const auto *object =
+      expr->getImplicitObjectArgument()->IgnoreParenNoopCasts(astContext);
+  const auto *buffer = cast<DeclRefExpr>(object)->getDecl();
+
+  uint32_t index = incDecRWACSBufferCounter(expr, isAppend);
 
   auto bufferInfo = declIdMapper.getDeclResultId(buffer);
 
@@ -1868,232 +2127,315 @@ SpirvEvalInfo SPIRVEmitter::doCXXMemberCallExpr(const CXXMemberCallExpr *expr) {
 
   return processCall(expr);
 }
+void SPIRVEmitter::handleOptionalOffsetInMethodCall(
+    const CXXMemberCallExpr *expr, uint32_t index, uint32_t *constOffset,
+    uint32_t *varOffset) {
+  *constOffset = *varOffset = 0; // Initialize both first
+
+  if (expr->getNumArgs() == index + 1) { // Has offset argument
+    if (*constOffset = tryToEvaluateAsConst(expr->getArg(index)))
+      return; // Constant offset
+    else
+      *varOffset = doExpr(expr->getArg(index));
+  }
+};
 
 SpirvEvalInfo
 SPIRVEmitter::processIntrinsicMemberCall(const CXXMemberCallExpr *expr,
                                          hlsl::IntrinsicOp opcode) {
   using namespace hlsl;
 
-  // Handles the offset argument. If there exists an offset argument, writes the
-  // <result-id> to either *constOffset or *varOffset, depending on the
-  // constantness of the offset.
-  const auto handleOffset = [this](const CXXMemberCallExpr *expr,
-                                   uint32_t index, uint32_t *constOffset,
-                                   uint32_t *varOffset) {
-    *constOffset = *varOffset = 0; // Initialize both first
-
-    if (expr->getNumArgs() == index + 1) { // Has offset argument
-      if (*constOffset = tryToEvaluateAsConst(expr->getArg(index)))
-        return; // Constant offset
-      else
-        *varOffset = doExpr(expr->getArg(index));
-    }
-  };
-
-  const FunctionDecl *callee = expr->getDirectCallee();
-  const auto retType = typeTranslator.translateType(callee->getReturnType());
-
   switch (opcode) {
   case IntrinsicOp::MOP_Sample:
-  case IntrinsicOp::MOP_Gather: {
-    // Signatures:
-    // DXGI_FORMAT Object.Sample(sampler_state S,
-    //                           float Location
-    //                           [, int Offset]);
-    //
-    // <Template Type>4 Object.Gather(sampler_state S,
-    //                                float2|3|4 Location
-    //                                [, int2 Offset]);
-
-    const auto *imageExpr = expr->getImplicitObjectArgument();
-
-    const uint32_t imageType =
-        typeTranslator.translateType(imageExpr->getType());
-
-    const uint32_t image = loadIfGLValue(imageExpr);
-    const uint32_t sampler = doExpr(expr->getArg(0));
-    const uint32_t coordinate = doExpr(expr->getArg(1));
-    // .Sample()/.Gather() has a third optional paramter for offset.
-    uint32_t constOffset = 0, varOffset = 0;
-    handleOffset(expr, 2, &constOffset, &varOffset);
-
-    if (opcode == IntrinsicOp::MOP_Sample) {
-      return theBuilder.createImageSample(
-          retType, imageType, image, sampler, coordinate, /*bias*/ 0,
-          /*lod*/ 0, std::make_pair(0, 0), constOffset, varOffset,
-          /*constOffsets*/ 0, /*sampleNumber*/ 0);
-    } else {
-      return theBuilder.createImageGather(
-          retType, imageType, image, sampler, coordinate,
-          // .Gather() doc says we return four components of red data.
-          theBuilder.getConstantInt32(0), constOffset, varOffset,
-          /*constOffsets*/ 0, /*sampleNumber*/ 0);
-    }
-  }
+    return processTextureSampleGather(expr, /*isSample=*/true);
+  case IntrinsicOp::MOP_Gather:
+    return processTextureSampleGather(expr, /*isSample=*/false);
   case IntrinsicOp::MOP_SampleBias:
-  case IntrinsicOp::MOP_SampleLevel: {
-    // Signatures:
-    // DXGI_FORMAT Object.SampleBias(sampler_state S,
-    //                               float Location,
-    //                               float Bias
-    //                               [, int Offset]);
-    //
-    // DXGI_FORMAT Object.SampleLevel(sampler_state S,
-    //                                float Location,
-    //                                float LOD
-    //                                [, int Offset]);
-    const auto *imageExpr = expr->getImplicitObjectArgument();
+    return processTextureSampleBiasLevel(expr, /*isBias=*/true);
+  case IntrinsicOp::MOP_SampleLevel:
+    return processTextureSampleBiasLevel(expr, /*isBias=*/false);
+  case IntrinsicOp::MOP_SampleGrad:
+    return processTextureSampleGrad(expr);
+  case IntrinsicOp::MOP_SampleCmp:
+    return processTextureSampleCmpCmpLevelZero(expr, /*isCmp=*/true);
+  case IntrinsicOp::MOP_SampleCmpLevelZero:
+    return processTextureSampleCmpCmpLevelZero(expr, /*isCmp=*/false);
+  case IntrinsicOp::MOP_GatherRed:
+    return processTextureGatherRGBACmpRGBA(expr, /*isCmp=*/false, 0);
+  case IntrinsicOp::MOP_GatherGreen:
+    return processTextureGatherRGBACmpRGBA(expr, /*isCmp=*/false, 1);
+  case IntrinsicOp::MOP_GatherBlue:
+    return processTextureGatherRGBACmpRGBA(expr, /*isCmp=*/false, 2);
+  case IntrinsicOp::MOP_GatherAlpha:
+    return processTextureGatherRGBACmpRGBA(expr, /*isCmp=*/false, 3);
+  case IntrinsicOp::MOP_GatherCmp:
+    return processTextureGatherCmp(expr);
+  case IntrinsicOp::MOP_GatherCmpRed:
+    return processTextureGatherRGBACmpRGBA(expr, /*isCmp=*/true, 0);
+  case IntrinsicOp::MOP_Load:
+    return processBufferTextureLoad(expr);
+  case IntrinsicOp::MOP_Load2:
+    return processByteAddressBufferLoadStore(expr, 2, /*doStore*/ false);
+  case IntrinsicOp::MOP_Load3:
+    return processByteAddressBufferLoadStore(expr, 3, /*doStore*/ false);
+  case IntrinsicOp::MOP_Load4:
+    return processByteAddressBufferLoadStore(expr, 4, /*doStore*/ false);
+  case IntrinsicOp::MOP_Store:
+    return processByteAddressBufferLoadStore(expr, 1, /*doStore*/ true);
+  case IntrinsicOp::MOP_Store2:
+    return processByteAddressBufferLoadStore(expr, 2, /*doStore*/ true);
+  case IntrinsicOp::MOP_Store3:
+    return processByteAddressBufferLoadStore(expr, 3, /*doStore*/ true);
+  case IntrinsicOp::MOP_Store4:
+    return processByteAddressBufferLoadStore(expr, 4, /*doStore*/ true);
+  case IntrinsicOp::MOP_GetDimensions:
+    return processGetDimensions(expr);
+  case IntrinsicOp::MOP_CalculateLevelOfDetail:
+    return processTextureLevelOfDetail(expr);
+  case IntrinsicOp::MOP_IncrementCounter:
+    return theBuilder.createUnaryOp(
+        spv::Op::OpBitcast, theBuilder.getUint32Type(),
+        incDecRWACSBufferCounter(expr, /*isInc*/ true));
+  case IntrinsicOp::MOP_DecrementCounter:
+    return theBuilder.createUnaryOp(
+        spv::Op::OpBitcast, theBuilder.getUint32Type(),
+        incDecRWACSBufferCounter(expr, /*isInc*/ false));
+  case IntrinsicOp::MOP_Append:
+  case IntrinsicOp::MOP_Consume:
+    return processACSBufferAppendConsume(expr);
+  case IntrinsicOp::MOP_InterlockedAdd:
+  case IntrinsicOp::MOP_InterlockedAnd:
+  case IntrinsicOp::MOP_InterlockedOr:
+  case IntrinsicOp::MOP_InterlockedXor:
+  case IntrinsicOp::MOP_InterlockedUMax:
+  case IntrinsicOp::MOP_InterlockedUMin:
+  case IntrinsicOp::MOP_InterlockedMax:
+  case IntrinsicOp::MOP_InterlockedMin:
+  case IntrinsicOp::MOP_InterlockedExchange:
+  case IntrinsicOp::MOP_InterlockedCompareExchange:
+  case IntrinsicOp::MOP_InterlockedCompareStore:
+    return processRWByteAddressBufferAtomicMethods(opcode, expr);
+  }
 
-    const uint32_t imageType =
-        typeTranslator.translateType(imageExpr->getType());
+  emitError("HLSL intrinsic member call unimplemented: %0")
+      << expr->getDirectCallee()->getName();
+  return 0;
+}
 
-    const uint32_t image = loadIfGLValue(imageExpr);
-    const uint32_t sampler = doExpr(expr->getArg(0));
-    const uint32_t coordinate = doExpr(expr->getArg(1));
-    uint32_t lod = 0;
-    uint32_t bias = 0;
-    if (opcode == IntrinsicOp::MOP_SampleBias) {
-      bias = doExpr(expr->getArg(2));
+uint32_t SPIRVEmitter::processTextureSampleGather(const CXXMemberCallExpr *expr,
+                                                  const bool isSample) {
+  // Signatures:
+  // DXGI_FORMAT Object.Sample(sampler_state S,
+  //                           float Location
+  //                           [, int Offset]);
+  //
+  // <Template Type>4 Object.Gather(sampler_state S,
+  //                                float2|3|4 Location
+  //                                [, int2 Offset]);
+
+  const auto *imageExpr = expr->getImplicitObjectArgument();
+
+  const uint32_t imageType = typeTranslator.translateType(imageExpr->getType());
+
+  const uint32_t image = loadIfGLValue(imageExpr);
+  const uint32_t sampler = doExpr(expr->getArg(0));
+  const uint32_t coordinate = doExpr(expr->getArg(1));
+  // .Sample()/.Gather() has a third optional paramter for offset.
+  uint32_t constOffset = 0, varOffset = 0;
+  handleOptionalOffsetInMethodCall(expr, 2, &constOffset, &varOffset);
+
+  const auto retType =
+      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
+
+  if (isSample) {
+    return theBuilder.createImageSample(
+        retType, imageType, image, sampler, coordinate, /*compareVal*/ 0,
+        /*bias*/ 0, /*lod*/ 0, std::make_pair(0, 0), constOffset, varOffset,
+        /*constOffsets*/ 0, /*sampleNumber*/ 0);
+  } else {
+    return theBuilder.createImageGather(
+        retType, imageType, image, sampler, coordinate,
+        // .Gather() doc says we return four components of red data.
+        theBuilder.getConstantInt32(0), /*compareVal*/ 0, constOffset,
+        varOffset, /*constOffsets*/ 0, /*sampleNumber*/ 0);
+  }
+}
+
+uint32_t
+SPIRVEmitter::processTextureSampleBiasLevel(const CXXMemberCallExpr *expr,
+                                            const bool isBias) {
+  // Signatures:
+  // DXGI_FORMAT Object.SampleBias(sampler_state S,
+  //                               float Location,
+  //                               float Bias
+  //                               [, int Offset]);
+  //
+  // DXGI_FORMAT Object.SampleLevel(sampler_state S,
+  //                                float Location,
+  //                                float LOD
+  //                                [, int Offset]);
+  const auto *imageExpr = expr->getImplicitObjectArgument();
+
+  const uint32_t imageType = typeTranslator.translateType(imageExpr->getType());
+
+  const uint32_t image = loadIfGLValue(imageExpr);
+  const uint32_t sampler = doExpr(expr->getArg(0));
+  const uint32_t coordinate = doExpr(expr->getArg(1));
+  uint32_t lod = 0;
+  uint32_t bias = 0;
+  if (isBias) {
+    bias = doExpr(expr->getArg(2));
+  } else {
+    lod = doExpr(expr->getArg(2));
+  }
+  // .Bias()/.SampleLevel() has a fourth optional paramter for offset.
+  uint32_t constOffset = 0, varOffset = 0;
+  handleOptionalOffsetInMethodCall(expr, 3, &constOffset, &varOffset);
+
+  const auto retType =
+      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
+
+  return theBuilder.createImageSample(
+      retType, imageType, image, sampler, coordinate, /*compareVal*/ 0, bias,
+      lod, std::make_pair(0, 0), constOffset, varOffset, /*constOffsets*/ 0,
+      /*sampleNumber*/ 0);
+}
+
+uint32_t SPIRVEmitter::processTextureSampleGrad(const CXXMemberCallExpr *expr) {
+  // Signature:
+  // DXGI_FORMAT Object.SampleGrad(sampler_state S,
+  //                               float Location,
+  //                               float DDX,
+  //                               float DDY
+  //                               [, int Offset]);
+
+  const auto *imageExpr = expr->getImplicitObjectArgument();
+
+  const uint32_t imageType = typeTranslator.translateType(imageExpr->getType());
+
+  const uint32_t image = loadIfGLValue(imageExpr);
+  const uint32_t sampler = doExpr(expr->getArg(0));
+  const uint32_t coordinate = doExpr(expr->getArg(1));
+  const uint32_t ddx = doExpr(expr->getArg(2));
+  const uint32_t ddy = doExpr(expr->getArg(3));
+  // .SampleGrad() has a fifth optional paramter for offset.
+  uint32_t constOffset = 0, varOffset = 0;
+  handleOptionalOffsetInMethodCall(expr, 4, &constOffset, &varOffset);
+
+  const auto retType =
+      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
+
+  return theBuilder.createImageSample(
+      retType, imageType, image, sampler, coordinate, /*compareVal*/ 0,
+      /*bias*/ 0, /*lod*/ 0, std::make_pair(ddx, ddy), constOffset, varOffset,
+      /*constOffsets*/ 0,
+      /*sampleNumber*/ 0);
+}
+
+uint32_t
+SPIRVEmitter::processTextureSampleCmpCmpLevelZero(const CXXMemberCallExpr *expr,
+                                                  const bool isCmp) {
+  // .SampleCmp() Signature:
+  //
+  // float Object.SampleCmp(
+  //   SamplerComparisonState S,
+  //   float Location,
+  //   float CompareValue,
+  //   [int Offset]
+  // );
+  //
+  // .SampleCmpLevelZero() is identical to .SampleCmp() on mipmap level 0 only.
+  const auto *imageExpr = expr->getImplicitObjectArgument();
+
+  const uint32_t image = loadIfGLValue(imageExpr);
+  const uint32_t sampler = doExpr(expr->getArg(0));
+  const uint32_t coordinate = doExpr(expr->getArg(1));
+  const uint32_t compareVal = doExpr(expr->getArg(2));
+  // .SampleCmp() has a fourth optional paramter for offset.
+  uint32_t constOffset = 0, varOffset = 0;
+  handleOptionalOffsetInMethodCall(expr, 3, &constOffset, &varOffset);
+  const uint32_t lod = isCmp ? 0 : theBuilder.getConstantFloat32(0);
+
+  const auto retType =
+      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
+  const auto imageType = typeTranslator.translateType(imageExpr->getType());
+
+  return theBuilder.createImageSample(
+      retType, imageType, image, sampler, coordinate, compareVal, /*bias*/ 0,
+      lod, std::make_pair(0, 0), constOffset, varOffset,
+      /*constOffsets*/ 0, /*sampleNumber*/ 0);
+}
+
+SpirvEvalInfo
+SPIRVEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
+  // Signature:
+  // ret Object.Load(int Location
+  //                 [, int SampleIndex,]
+  //                 [, int Offset]);
+
+  const auto *object = expr->getImplicitObjectArgument();
+  const auto *location = expr->getArg(0);
+  const auto objectType = object->getType();
+
+  if (typeTranslator.isRWByteAddressBuffer(objectType) ||
+      typeTranslator.isByteAddressBuffer(objectType))
+    return processByteAddressBufferLoadStore(expr, 1, /*doStore*/ false);
+
+  if (TypeTranslator::isStructuredBuffer(objectType))
+    return processStructuredBufferLoad(expr);
+
+  if (TypeTranslator::isBuffer(objectType) ||
+      TypeTranslator::isRWBuffer(objectType) ||
+      TypeTranslator::isRWTexture(objectType))
+    return processBufferTextureLoad(object, doExpr(location));
+
+  if (TypeTranslator::isTexture(objectType)) {
+    // .Load() has a second optional paramter for offset.
+    const auto locationId = doExpr(location);
+    uint32_t constOffset = 0, varOffset = 0;
+    uint32_t coordinate = locationId, lod = 0;
+
+    if (TypeTranslator::isTextureMS(objectType)) {
+      // SampleIndex is only available when the Object is of Texture2DMS or
+      // Texture2DMSArray types. Under those cases, Offset will be the third
+      // parameter (index 2).
+      lod = doExpr(expr->getArg(1));
+      handleOptionalOffsetInMethodCall(expr, 2, &constOffset, &varOffset);
     } else {
-      lod = doExpr(expr->getArg(2));
+      // For Texture Load() functions, the location parameter is a vector
+      // that consists of both the coordinate and the mipmap level (via the
+      // last vector element). We need to split it here since the
+      // OpImageFetch SPIR-V instruction encodes them as separate arguments.
+      splitVecLastElement(location->getType(), locationId, &coordinate, &lod);
+      // For textures other than Texture2DMS(Array), offset should be the
+      // second parameter (index 1).
+      handleOptionalOffsetInMethodCall(expr, 1, &constOffset, &varOffset);
     }
-    // .Bias()/.SampleLevel() has a fourth optional paramter for offset.
-    uint32_t constOffset = 0, varOffset = 0;
-    handleOffset(expr, 3, &constOffset, &varOffset);
 
-    return theBuilder.createImageSample(
-        retType, imageType, image, sampler, coordinate, bias, lod,
-        std::make_pair(0, 0), constOffset, varOffset, /*constOffsets*/ 0,
-        /*sampleNumber*/ 0);
+    return processBufferTextureLoad(object, coordinate, constOffset, varOffset,
+                                    lod);
   }
-  case IntrinsicOp::MOP_SampleGrad: {
-    // Signature:
-    // DXGI_FORMAT Object.SampleGrad(sampler_state S,
-    //                               float Location,
-    //                               float DDX,
-    //                               float DDY
-    //                               [, int Offset]);
+  emitError("Load() is not implemented for the given object type.");
+  return 0;
+}
 
-    const auto *imageExpr = expr->getImplicitObjectArgument();
-
-    const uint32_t imageType =
-        typeTranslator.translateType(imageExpr->getType());
-
-    const uint32_t image = loadIfGLValue(imageExpr);
-    const uint32_t sampler = doExpr(expr->getArg(0));
-    const uint32_t coordinate = doExpr(expr->getArg(1));
-    const uint32_t ddx = doExpr(expr->getArg(2));
-    const uint32_t ddy = doExpr(expr->getArg(3));
-    // .SampleGrad() has a fifth optional paramter for offset.
-    uint32_t constOffset = 0, varOffset = 0;
-    handleOffset(expr, 4, &constOffset, &varOffset);
-
-    return theBuilder.createImageSample(
-        retType, imageType, image, sampler, coordinate, /*bias*/ 0, /*lod*/ 0,
-        std::make_pair(ddx, ddy), constOffset, varOffset, /*constOffsets*/ 0,
-        /*sampleNumber*/ 0);
-  }
-  case IntrinsicOp::MOP_Load: {
-    // Signature:
-    // ret Object.Load(int Location
-    //                 [, int SampleIndex,]
-    //                 [, int Offset]);
-
-    const auto *object = expr->getImplicitObjectArgument();
-    const auto *location = expr->getArg(0);
-    const auto objectType = object->getType();
-
-    if (typeTranslator.isRWByteAddressBuffer(objectType) ||
-        typeTranslator.isByteAddressBuffer(objectType))
-      return processByteAddressBufferLoadStore(expr, 1, /*doStore*/ false);
-
-    if (TypeTranslator::isStructuredBuffer(objectType))
-      return processStructuredBufferLoad(expr);
-
-    if (TypeTranslator::isBuffer(objectType) ||
-        TypeTranslator::isRWBuffer(objectType) ||
-        TypeTranslator::isRWTexture(objectType))
-      return processBufferTextureLoad(object, doExpr(location));
-
-    if (TypeTranslator::isTexture(objectType)) {
-      // .Load() has a second optional paramter for offset.
-      const auto locationId = doExpr(location);
-      uint32_t constOffset = 0, varOffset = 0;
-      uint32_t coordinate = locationId, lod = 0;
-
-      if (TypeTranslator::isTextureMS(objectType)) {
-        // SampleIndex is only available when the Object is of Texture2DMS or
-        // Texture2DMSArray types. Under those cases, Offset will be the third
-        // parameter (index 2).
-        lod = doExpr(expr->getArg(1));
-        handleOffset(expr, 2, &constOffset, &varOffset);
-      } else {
-        // For Texture Load() functions, the location parameter is a vector
-        // that consists of both the coordinate and the mipmap level (via the
-        // last vector element). We need to split it here since the
-        // OpImageFetch SPIR-V instruction encodes them as separate arguments.
-        splitVecLastElement(location->getType(), locationId, &coordinate, &lod);
-        // For textures other than Texture2DMS(Array), offset should be the
-        // second parameter (index 1).
-        handleOffset(expr, 1, &constOffset, &varOffset);
-      }
-
-      return processBufferTextureLoad(object, coordinate, constOffset,
-                                      varOffset, lod);
-    }
-    emitError("Load() is not implemented for the given object type.");
+uint32_t SPIRVEmitter::processGetDimensions(const CXXMemberCallExpr *expr) {
+  const auto objectType = expr->getImplicitObjectArgument()->getType();
+  if (TypeTranslator::isTexture(objectType) ||
+      TypeTranslator::isRWTexture(objectType) ||
+      TypeTranslator::isBuffer(objectType) ||
+      TypeTranslator::isRWBuffer(objectType)) {
+    return processBufferTextureGetDimensions(expr);
+  } else if (TypeTranslator::isByteAddressBuffer(objectType) ||
+             TypeTranslator::isRWByteAddressBuffer(objectType) ||
+             TypeTranslator::isStructuredBuffer(objectType) ||
+             TypeTranslator::isAppendStructuredBuffer(objectType) ||
+             TypeTranslator::isConsumeStructuredBuffer(objectType)) {
+    return processByteAddressBufferStructuredBufferGetDimensions(expr);
+  } else {
+    emitError("GetDimensions not implmented for the given type yet.");
     return 0;
   }
-  case IntrinsicOp::MOP_Load2: {
-    return processByteAddressBufferLoadStore(expr, 2, /*doStore*/ false);
-  }
-  case IntrinsicOp::MOP_Load3: {
-    return processByteAddressBufferLoadStore(expr, 3, /*doStore*/ false);
-  }
-  case IntrinsicOp::MOP_Load4: {
-    return processByteAddressBufferLoadStore(expr, 4, /*doStore*/ false);
-  }
-  case IntrinsicOp::MOP_Store: {
-    return processByteAddressBufferLoadStore(expr, 1, /*doStore*/ true);
-  }
-  case IntrinsicOp::MOP_Store2: {
-    return processByteAddressBufferLoadStore(expr, 2, /*doStore*/ true);
-  }
-  case IntrinsicOp::MOP_Store3: {
-    return processByteAddressBufferLoadStore(expr, 3, /*doStore*/ true);
-  }
-  case IntrinsicOp::MOP_Store4: {
-    return processByteAddressBufferLoadStore(expr, 4, /*doStore*/ true);
-  }
-  case IntrinsicOp::MOP_Append:
-  case IntrinsicOp::MOP_Consume: {
-    return processACSBufferAppendConsume(expr);
-  }
-  case IntrinsicOp::MOP_GetDimensions: {
-    const auto objectType = expr->getImplicitObjectArgument()->getType();
-    if (TypeTranslator::isTexture(objectType) ||
-        TypeTranslator::isRWTexture(objectType) ||
-        TypeTranslator::isBuffer(objectType) ||
-        TypeTranslator::isRWBuffer(objectType)) {
-      return processBufferTextureGetDimensions(expr);
-    } else if (TypeTranslator::isByteAddressBuffer(objectType) ||
-               TypeTranslator::isRWByteAddressBuffer(objectType) ||
-               TypeTranslator::isStructuredBuffer(objectType) ||
-               TypeTranslator::isAppendStructuredBuffer(objectType) ||
-               TypeTranslator::isConsumeStructuredBuffer(objectType)) {
-      return processByteAddressBufferStructuredBufferGetDimensions(expr);
-    } else {
-      emitError("GetDimensions not implmented for the given type yet.");
-      return 0;
-    }
-  }
-  case IntrinsicOp::MOP_CalculateLevelOfDetail: {
-    return processTextureLevelOfDetail(expr);
-  }
-  }
-  emitError("HLSL intrinsic member call unimplemented: %0")
-      << callee->getName();
-  return 0;
 }
 
 SpirvEvalInfo
@@ -2288,13 +2630,16 @@ SpirvEvalInfo SPIRVEmitter::doInitListExpr(const InitListExpr *expr) {
 
 SpirvEvalInfo SPIRVEmitter::doMemberExpr(const MemberExpr *expr) {
   llvm::SmallVector<uint32_t, 4> indices;
+
   const Expr *base = collectArrayStructIndices(expr, &indices);
   auto info = doExpr(base);
 
-  const uint32_t ptrType = theBuilder.getPointerType(
-      typeTranslator.translateType(expr->getType(), info.layoutRule),
-      info.storageClass);
-  info.resultId = theBuilder.createAccessChain(ptrType, info, indices);
+  if (!indices.empty()) {
+    const uint32_t ptrType = theBuilder.getPointerType(
+        typeTranslator.translateType(expr->getType(), info.layoutRule),
+        info.storageClass);
+    info.resultId = theBuilder.createAccessChain(ptrType, info, indices);
+  }
 
   return info;
 }
@@ -2524,8 +2869,8 @@ void SPIRVEmitter::storeValue(const SpirvEvalInfo &lhsPtr,
   } else if (const auto *recordType = valType->getAs<RecordType>()) {
     uint32_t index = 0;
     for (const auto *decl : recordType->getDecl()->decls()) {
-      // Implicit generated struct declarations should be ignored.
-      if (isa<CXXRecordDecl>(decl) && decl->isImplicit())
+      // Ignore implicit generated struct declarations/constructors/destructors.
+      if (decl->isImplicit())
         continue;
 
       const auto *field = cast<FieldDecl>(decl);
@@ -3231,6 +3576,15 @@ SPIRVEmitter::processMatrixBinaryOp(const Expr *lhs, const Expr *rhs,
 const Expr *SPIRVEmitter::collectArrayStructIndices(
     const Expr *expr, llvm::SmallVectorImpl<uint32_t> *indices) {
   if (const auto *indexing = dyn_cast<MemberExpr>(expr)) {
+    // First check whether this is referring to a static member. If it is, we
+    // create a DeclRefExpr for it.
+    if (auto *varDecl = dyn_cast<VarDecl>(indexing->getMemberDecl()))
+      if (varDecl->isStaticDataMember())
+        return DeclRefExpr::Create(
+            astContext, NestedNameSpecifierLoc(), SourceLocation(), varDecl,
+            /*RefersToEnclosingVariableOrCapture=*/false, SourceLocation(),
+            varDecl->getType(), VK_LValue);
+
     const Expr *base = collectArrayStructIndices(
         indexing->getBase()->IgnoreParenNoopCasts(astContext), indices);
 
@@ -3381,6 +3735,13 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
 
   GLSLstd450 glslOpcode = GLSLstd450Bad;
 
+#define INTRINSIC_SPIRV_OP_WITH_CAP_CASE(intrinsicOp, spirvOp, doEachVec, cap) \
+  case hlsl::IntrinsicOp::IOP_##intrinsicOp: {                                 \
+    theBuilder.requireCapability(cap);                                         \
+    return processIntrinsicUsingSpirvInst(callExpr, spv::Op::Op##spirvOp,      \
+                                          doEachVec);                          \
+  } break
+
 #define INTRINSIC_SPIRV_OP_CASE(intrinsicOp, spirvOp, doEachVec)               \
   case hlsl::IntrinsicOp::IOP_##intrinsicOp: {                                 \
     return processIntrinsicUsingSpirvInst(callExpr, spv::Op::Op##spirvOp,      \
@@ -3419,7 +3780,19 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     return processIntrinsicUsingGLSLInst(callExpr, glslOpcode, doEachVec);     \
   } break
 
-  switch (static_cast<hlsl::IntrinsicOp>(opcode)) {
+  switch (const auto hlslOpcode = static_cast<hlsl::IntrinsicOp>(opcode)) {
+  case hlsl::IntrinsicOp::IOP_InterlockedAdd:
+  case hlsl::IntrinsicOp::IOP_InterlockedAnd:
+  case hlsl::IntrinsicOp::IOP_InterlockedMax:
+  case hlsl::IntrinsicOp::IOP_InterlockedUMax:
+  case hlsl::IntrinsicOp::IOP_InterlockedMin:
+  case hlsl::IntrinsicOp::IOP_InterlockedUMin:
+  case hlsl::IntrinsicOp::IOP_InterlockedOr:
+  case hlsl::IntrinsicOp::IOP_InterlockedXor:
+  case hlsl::IntrinsicOp::IOP_InterlockedExchange:
+  case hlsl::IntrinsicOp::IOP_InterlockedCompareStore:
+  case hlsl::IntrinsicOp::IOP_InterlockedCompareExchange:
+    return processIntrinsicInterlockedMethod(callExpr, hlslOpcode);
   case hlsl::IntrinsicOp::IOP_dot:
     return processIntrinsicDot(callExpr);
   case hlsl::IntrinsicOp::IOP_mul:
@@ -3456,6 +3829,9 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
   case hlsl::IntrinsicOp::IOP_sincos: {
     return processIntrinsicSinCos(callExpr);
   }
+  case hlsl::IntrinsicOp::IOP_rcp: {
+    return processIntrinsicRcp(callExpr);
+  }
   case hlsl::IntrinsicOp::IOP_saturate: {
     return processIntrinsicSaturate(callExpr);
   }
@@ -3463,10 +3839,21 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     return processIntrinsicLog10(callExpr);
   }
     INTRINSIC_SPIRV_OP_CASE(transpose, Transpose, false);
+    INTRINSIC_SPIRV_OP_CASE(ddx, DPdx, true);
+    INTRINSIC_SPIRV_OP_WITH_CAP_CASE(ddx_coarse, DPdxCoarse, false,
+                                     spv::Capability::DerivativeControl);
+    INTRINSIC_SPIRV_OP_WITH_CAP_CASE(ddx_fine, DPdxFine, false,
+                                     spv::Capability::DerivativeControl);
+    INTRINSIC_SPIRV_OP_CASE(ddy, DPdy, true);
+    INTRINSIC_SPIRV_OP_WITH_CAP_CASE(ddy_coarse, DPdyCoarse, false,
+                                     spv::Capability::DerivativeControl);
+    INTRINSIC_SPIRV_OP_WITH_CAP_CASE(ddy_fine, DPdyFine, false,
+                                     spv::Capability::DerivativeControl);
     INTRINSIC_SPIRV_OP_CASE(countbits, BitCount, false);
     INTRINSIC_SPIRV_OP_CASE(isinf, IsInf, true);
     INTRINSIC_SPIRV_OP_CASE(isnan, IsNan, true);
     INTRINSIC_SPIRV_OP_CASE(fmod, FMod, true);
+    INTRINSIC_SPIRV_OP_CASE(fwidth, Fwidth, true);
     INTRINSIC_SPIRV_OP_CASE(reversebits, BitReverse, false);
     INTRINSIC_OP_CASE(round, Round, true);
     INTRINSIC_OP_CASE_INT_FLOAT(abs, SAbs, FAbs, true);
@@ -3485,6 +3872,7 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     INTRINSIC_OP_CASE(exp2, Exp2, true);
     INTRINSIC_OP_CASE_SINT_UINT(firstbithigh, FindSMsb, FindUMsb, false);
     INTRINSIC_OP_CASE_SINT_UINT(ufirstbithigh, FindSMsb, FindUMsb, false);
+    INTRINSIC_OP_CASE(faceforward, FaceForward, false);
     INTRINSIC_OP_CASE(firstbitlow, FindILsb, false);
     INTRINSIC_OP_CASE(floor, Floor, true);
     INTRINSIC_OP_CASE(fma, Fma, true);
@@ -3521,6 +3909,118 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
 
 #undef INTRINSIC_OP_CASE
 #undef INTRINSIC_OP_CASE_INT_FLOAT
+
+  return 0;
+}
+
+uint32_t
+SPIRVEmitter::processIntrinsicInterlockedMethod(const CallExpr *expr,
+                                                hlsl::IntrinsicOp opcode) {
+  // The signature of intrinsic atomic methods are:
+  // void Interlocked*(in R dest, in T value);
+  // void Interlocked*(in R dest, in T value, out T original_value);
+
+  // Note: ALL Interlocked*() methods are forced to have an unsigned integer
+  // 'value'. Meaning, T is forced to be 'unsigned int'. If the provided
+  // parameter is not an unsigned integer, the frontend inserts an
+  // 'ImplicitCastExpr' to convert it to unsigned integer. OpAtomicIAdd (and
+  // other SPIR-V OpAtomic* instructions) require that the pointee in 'dest' to
+  // be of the same type as T. This will result in an invalid SPIR-V if 'dest'
+  // is a signed integer typed resource such as RWTexture1D<int>. For example,
+  // the following OpAtomicIAdd is invalid because the pointee type defined in
+  // %1 is a signed integer, while the value passed to atomic add (%3) is an
+  // unsigned integer.
+  //
+  //  %_ptr_Image_int = OpTypePointer Image %int
+  //  %1 = OpImageTexelPointer %_ptr_Image_int %RWTexture1D_int %index %uint_0
+  //  %2 = OpLoad %int %value
+  //  %3 = OpBitcast %uint %2   <-------- Inserted by the frontend
+  //  %4 = OpAtomicIAdd %int %1 %uint_1 %uint_0 %3
+  //
+  // In such cases, we bypass the forced IntegralCast.
+  // Moreover, the frontend does not add a cast AST node to cast uint to int
+  // where necessary. To ensure SPIR-V validity, we add that where necessary.
+
+  const uint32_t zero = theBuilder.getConstantUint32(0);
+  const uint32_t scope = theBuilder.getConstantUint32(1); // Device
+  const auto *dest = expr->getArg(0);
+  const auto baseType = dest->getType();
+  const uint32_t baseTypeId = typeTranslator.translateType(baseType);
+
+  const auto doArg = [baseType, this](const CallExpr *callExpr,
+                                      uint32_t argIndex) {
+    const Expr *valueExpr = callExpr->getArg(argIndex);
+    if (const auto *castExpr = dyn_cast<ImplicitCastExpr>(valueExpr))
+      if (castExpr->getCastKind() == CK_IntegralCast &&
+          castExpr->getSubExpr()->getType() == baseType)
+        valueExpr = castExpr->getSubExpr();
+
+    uint32_t argId = doExpr(valueExpr);
+    if (valueExpr->getType() != baseType)
+      argId = castToInt(argId, valueExpr->getType(), baseType);
+    return argId;
+  };
+
+  const auto writeToOutputArg = [&baseType, this](
+      uint32_t toWrite, const CallExpr *callExpr, uint32_t outputArgIndex) {
+    const auto outputArg = callExpr->getArg(outputArgIndex);
+    const auto outputArgType = outputArg->getType();
+    if (baseType != outputArgType)
+      toWrite = castToInt(toWrite, baseType, outputArgType);
+    theBuilder.createStore(doExpr(outputArg), toWrite);
+  };
+
+  // If the argument is indexing into a texture/buffer, we need to create an
+  // OpImageTexelPointer instruction.
+  uint32_t ptr = 0;
+  if (const auto *callExpr = dyn_cast<CXXOperatorCallExpr>(dest)) {
+    const Expr *base = nullptr;
+    const Expr *index = nullptr;
+    if (isBufferTextureIndexing(callExpr, &base, &index)) {
+      const auto ptrType =
+          theBuilder.getPointerType(baseTypeId, spv::StorageClass::Image);
+      const auto baseId = doExpr(base);
+      const auto coordId = doExpr(index);
+      ptr = theBuilder.createImageTexelPointer(ptrType, baseId, coordId, zero);
+    }
+  } else {
+    ptr = doExpr(dest);
+  }
+
+  const bool isCompareExchange =
+      opcode == hlsl::IntrinsicOp::IOP_InterlockedCompareExchange;
+  const bool isCompareStore =
+      opcode == hlsl::IntrinsicOp::IOP_InterlockedCompareStore;
+
+  if (isCompareExchange || isCompareStore) {
+    const uint32_t comparator = doArg(expr, 1);
+    const uint32_t valueId = doArg(expr, 2);
+    const uint32_t originalVal = theBuilder.createAtomicCompareExchange(
+        baseTypeId, ptr, scope, zero, zero, valueId, comparator);
+    if (isCompareExchange)
+      writeToOutputArg(originalVal, expr, 3);
+  } else {
+    const uint32_t valueId = doArg(expr, 1);
+    // Since these atomic operations write through the provided pointer, the
+    // signed vs. unsigned opcode must be decided based on the pointee type
+    // of the first argument. However, the frontend decides the opcode based on
+    // the second argument (value). Therefore, the HLSL opcode provided by the
+    // frontend may be wrong. Therefore we need the following code to make sure
+    // we are using the correct SPIR-V opcode.
+    spv::Op atomicOp = translateAtomicHlslOpcodeToSpirvOpcode(opcode);
+    if (atomicOp == spv::Op::OpAtomicUMax && baseType->isSignedIntegerType())
+      atomicOp = spv::Op::OpAtomicSMax;
+    if (atomicOp == spv::Op::OpAtomicSMax && baseType->isUnsignedIntegerType())
+      atomicOp = spv::Op::OpAtomicUMax;
+    if (atomicOp == spv::Op::OpAtomicUMin && baseType->isSignedIntegerType())
+      atomicOp = spv::Op::OpAtomicSMin;
+    if (atomicOp == spv::Op::OpAtomicSMin && baseType->isUnsignedIntegerType())
+      atomicOp = spv::Op::OpAtomicUMin;
+    const uint32_t originalVal = theBuilder.createAtomicOp(
+        atomicOp, baseTypeId, ptr, scope, zero, valueId);
+    if (expr->getNumArgs() > 2)
+      writeToOutputArg(originalVal, expr, 2);
+  }
 
   return 0;
 }
@@ -4022,6 +4522,34 @@ uint32_t SPIRVEmitter::processIntrinsicDot(const CallExpr *callExpr) {
   }
 }
 
+uint32_t SPIRVEmitter::processIntrinsicRcp(const CallExpr *callExpr) {
+  // 'rcp' takes only 1 argument that is a scalar, vector, or matrix of type
+  // float or double.
+  assert(callExpr->getNumArgs() == 1u);
+  const QualType returnType = callExpr->getType();
+  const uint32_t returnTypeId = typeTranslator.translateType(returnType);
+  const Expr *arg = callExpr->getArg(0);
+  const uint32_t argId = doExpr(arg);
+  const QualType argType = arg->getType();
+
+  // For cases with matrix argument.
+  QualType elemType = {};
+  uint32_t numRows = 0, numCols = 0;
+  if (TypeTranslator::isMxNMatrix(argType, &elemType, &numRows, &numCols)) {
+    const uint32_t vecOne = getVecValueOne(elemType, numCols);
+    const auto actOnEachVec = [this, vecOne](
+        uint32_t /*index*/, uint32_t vecType, uint32_t curRowId) {
+      return theBuilder.createBinaryOp(spv::Op::OpFDiv, vecType, vecOne,
+                                       curRowId);
+    };
+    return processEachVectorInMatrix(arg, argId, actOnEachVec);
+  }
+
+  // For cases with scalar or vector arguments.
+  return theBuilder.createBinaryOp(spv::Op::OpFDiv, returnTypeId,
+                                   getValueOne(argType), argId);
+}
+
 uint32_t SPIRVEmitter::processIntrinsicAllOrAny(const CallExpr *callExpr,
                                                 spv::Op spvOp) {
   // 'all' and 'any' take only 1 parameter.
@@ -4412,6 +4940,8 @@ uint32_t SPIRVEmitter::getValueOne(QualType type) {
   {
     QualType scalarType = {};
     if (TypeTranslator::isScalarType(type, &scalarType)) {
+      // TODO: Support other types such as short, half, etc.
+
       if (scalarType->isSignedIntegerType()) {
         return theBuilder.getConstantInt32(1);
       }
@@ -4420,8 +4950,14 @@ uint32_t SPIRVEmitter::getValueOne(QualType type) {
         return theBuilder.getConstantUint32(1);
       }
 
-      if (scalarType->isFloatingType()) {
-        return theBuilder.getConstantFloat32(1.0);
+      if (const auto *builtinType = scalarType->getAs<BuiltinType>()) {
+        // TODO: Add support for other types that are not covered yet.
+        switch (builtinType->getKind()) {
+        case BuiltinType::Double:
+          return theBuilder.getConstantFloat64(1.0);
+        case BuiltinType::Float:
+          return theBuilder.getConstantFloat32(1.0);
+        }
       }
     }
   }
@@ -4534,6 +5070,8 @@ uint32_t SPIRVEmitter::translateAPFloat(const llvm::APFloat &floatValue,
   switch (bitwidth) {
   case 32:
     return theBuilder.getConstantFloat32(floatValue.convertToFloat());
+  case 64:
+    return theBuilder.getConstantFloat64(floatValue.convertToDouble());
   default:
     break;
   }
@@ -4585,10 +5123,8 @@ SPIRVEmitter::getSpirvShaderStage(const hlsl::ShaderModel &model) {
 void SPIRVEmitter::AddRequiredCapabilitiesForShaderModel() {
   if (shaderModel.IsHS() || shaderModel.IsDS()) {
     theBuilder.requireCapability(spv::Capability::Tessellation);
-    emitError("Tasselation shaders are currently not supported.");
   } else if (shaderModel.IsGS()) {
     theBuilder.requireCapability(spv::Capability::Geometry);
-    emitError("Geometry shaders are currently not supported.");
   } else {
     theBuilder.requireCapability(spv::Capability::Shader);
   }
@@ -4601,8 +5137,161 @@ void SPIRVEmitter::AddExecutionModeForEntryPoint(uint32_t entryPointId) {
   }
 }
 
+bool SPIRVEmitter::processGeometryShaderAttributes(const FunctionDecl *decl) {
+  bool success = true;
+  assert(shaderModel.IsGS());
+  if (auto *vcAttr = decl->getAttr<HLSLMaxVertexCountAttr>()) {
+    theBuilder.addExecutionMode(entryFunctionId,
+                                spv::ExecutionMode::OutputVertices,
+                                {static_cast<uint32_t>(vcAttr->getCount())});
+  }
+
+  // Only one primitive type is permitted for the geometry shader.
+  bool outPoint = false, outLine = false, outTriangle = false, inPoint = false,
+       inLine = false, inTriangle = false, inLineAdj = false,
+       inTriangleAdj = false;
+  for (const auto *param : decl->params()) {
+    // Add an execution mode based on the output stream type. Do not an
+    // execution mode more than once.
+    if (param->hasAttr<HLSLInOutAttr>()) {
+      const auto paramType = param->getType();
+      if (hlsl::IsHLSLTriangleStreamType(paramType) && !outTriangle) {
+        theBuilder.addExecutionMode(
+            entryFunctionId, spv::ExecutionMode::OutputTriangleStrip, {});
+        outTriangle = true;
+      } else if (hlsl::IsHLSLLineStreamType(paramType) && !outLine) {
+        theBuilder.addExecutionMode(entryFunctionId,
+                                    spv::ExecutionMode::OutputLineStrip, {});
+        outLine = true;
+      } else if (hlsl::IsHLSLPointStreamType(paramType) && !outPoint) {
+        theBuilder.addExecutionMode(entryFunctionId,
+                                    spv::ExecutionMode::OutputPoints, {});
+        outPoint = true;
+      }
+      // An output stream parameter will not have the input primitive type
+      // attributes, so we can continue to the next parameter.
+      continue;
+    }
+
+    // Add an execution mode based on the input primitive type. Do not add an
+    // execution mode more than once.
+    if (param->hasAttr<HLSLTriangleAttr>() && !inTriangle) {
+      theBuilder.addExecutionMode(entryFunctionId,
+                                  spv::ExecutionMode::Triangles, {});
+      inTriangle = true;
+    } else if (param->hasAttr<HLSLTriangleAdjAttr>() && !inTriangleAdj) {
+      theBuilder.addExecutionMode(
+          entryFunctionId, spv::ExecutionMode::InputTrianglesAdjacency, {});
+      inTriangleAdj = true;
+    } else if (param->hasAttr<HLSLPointAttr>() && !inPoint) {
+      theBuilder.addExecutionMode(entryFunctionId,
+                                  spv::ExecutionMode::InputPoints, {});
+      inPoint = true;
+    } else if (param->hasAttr<HLSLLineAdjAttr>() && !inLineAdj) {
+      theBuilder.addExecutionMode(entryFunctionId,
+                                  spv::ExecutionMode::InputLinesAdjacency, {});
+      inLineAdj = true;
+    } else if (param->hasAttr<HLSLLineAttr>() && !inLine) {
+      theBuilder.addExecutionMode(entryFunctionId,
+                                  spv::ExecutionMode::InputLines, {});
+      inLine = true;
+    }
+  }
+  if (inPoint + inLine + inLineAdj + inTriangle + inTriangleAdj > 1) {
+    emitError("only one input primitive type can be specified in the geometry "
+              "shader");
+    success = false;
+  }
+  if (outPoint + outTriangle + outLine > 1) {
+    emitError("only one output primitive type can be specified in the geometry "
+              "shader");
+    success = false;
+  }
+
+  return success;
+}
+
+bool SPIRVEmitter::processTessellationShaderAttributes(
+    const FunctionDecl *decl, uint32_t *numOutputControlPoints) {
+  assert(shaderModel.IsHS() || shaderModel.IsDS());
+  using namespace spv;
+
+  if (auto *domain = decl->getAttr<HLSLDomainAttr>()) {
+    const auto domainType = domain->getDomainType().lower();
+    const ExecutionMode hsExecMode =
+        llvm::StringSwitch<ExecutionMode>(domainType)
+            .Case("tri", ExecutionMode::Triangles)
+            .Case("quad", ExecutionMode::Quads)
+            .Case("isoline", ExecutionMode::Isolines)
+            .Default(ExecutionMode::Max);
+    if (hsExecMode == ExecutionMode::Max) {
+      emitError("unknown domain type specified for entry function",
+                decl->getLocation());
+      return false;
+    }
+    theBuilder.addExecutionMode(entryFunctionId, hsExecMode, {});
+  }
+
+  // Early return for domain shaders as domain shaders only takes the 'domain'
+  // attribute.
+  if (shaderModel.IsDS())
+    return true;
+
+  if (auto *partitioning = decl->getAttr<HLSLPartitioningAttr>()) {
+    // TODO: Could not find an equivalent of "pow2" partitioning scheme in
+    // SPIR-V.
+    const auto scheme = partitioning->getScheme().lower();
+    const ExecutionMode hsExecMode =
+        llvm::StringSwitch<ExecutionMode>(scheme)
+            .Case("fractional_even", ExecutionMode::SpacingFractionalEven)
+            .Case("fractional_odd", ExecutionMode::SpacingFractionalOdd)
+            .Case("integer", ExecutionMode::SpacingEqual)
+            .Default(ExecutionMode::Max);
+    if (hsExecMode == ExecutionMode::Max) {
+      emitError("unknown partitioning scheme in hull shader",
+                decl->getLocation());
+      return false;
+    }
+    theBuilder.addExecutionMode(entryFunctionId, hsExecMode, {});
+  }
+  if (auto *outputTopology = decl->getAttr<HLSLOutputTopologyAttr>()) {
+    const auto topology = outputTopology->getTopology().lower();
+    const ExecutionMode hsExecMode =
+        llvm::StringSwitch<ExecutionMode>(topology)
+            .Case("point", ExecutionMode::PointMode)
+            .Case("triangle_cw", ExecutionMode::VertexOrderCw)
+            .Case("triangle_ccw", ExecutionMode::VertexOrderCcw)
+            .Default(ExecutionMode::Max);
+    // TODO: There is no SPIR-V equivalent for "line" topology. Is it the
+    // default?
+    if (topology != "line") {
+      if (hsExecMode != spv::ExecutionMode::Max) {
+        theBuilder.addExecutionMode(entryFunctionId, hsExecMode, {});
+      } else {
+        emitError("unknown output topology in hull shader",
+                  decl->getLocation());
+        return false;
+      }
+    }
+  }
+  if (auto *controlPoints = decl->getAttr<HLSLOutputControlPointsAttr>()) {
+    *numOutputControlPoints = controlPoints->getCount();
+    theBuilder.addExecutionMode(entryFunctionId,
+                                spv::ExecutionMode::OutputVertices,
+                                {*numOutputControlPoints});
+  }
+
+  return true;
+}
+
 bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
                                             const uint32_t entryFuncId) {
+  // These are going to be used for Hull shaders only.
+  uint32_t numOutputControlPoints = 0;
+  uint32_t outputControlPointIdVal = 0;
+  uint32_t primitiveIdVar = 0;
+  uint32_t hullMainInputPatchParam = 0;
+
   // Construct the wrapper function signature.
   const uint32_t voidType = theBuilder.getVoidType();
   const uint32_t funcType = theBuilder.getFunctionType(voidType, {});
@@ -4628,6 +5317,12 @@ bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
       theBuilder.addExecutionMode(entryFunctionId,
                                   spv::ExecutionMode::LocalSize, {1, 1, 1});
     }
+  } else if (shaderModel.IsHS() || shaderModel.IsDS()) {
+    if (!processTessellationShaderAttributes(decl, &numOutputControlPoints))
+      return false;
+  } else if (shaderModel.IsGS()) {
+    if (!processGeometryShaderAttributes(decl))
+      return false;
   }
 
   // The entry basic block.
@@ -4650,12 +5345,51 @@ bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
 
     // Create the stage input variable for parameter not marked as pure out and
     // initialize the corresponding temporary variable
-    if (!param->getAttr<HLSLOutAttr>()) {
+    // Also do not create input variables for output stream objects of geometry
+    // shaders (e.g. TriangleStream) which are required to be marked as 'inout'.
+    bool isGSOutputStream = shaderModel.IsGS() &&
+                            param->hasAttr<HLSLInOutAttr>() &&
+                            hlsl::IsHLSLStreamOutputType(param->getType());
+    if (!param->hasAttr<HLSLOutAttr>() && !isGSOutputStream) {
       uint32_t loadedValue = 0;
-      if (!declIdMapper.createStageInputVar(param, &loadedValue))
+      if (shaderModel.IsHS() &&
+          TypeTranslator::isInputPatch(param->getType())) {
+        const uint32_t hullInputPatchId =
+            declIdMapper.createStageVarWithoutSemantics(
+                /*isInput*/ true, typeId, "hullEntryPointInput",
+                decl->getAttr<VKLocationAttr>());
+        loadedValue = theBuilder.createLoad(typeId, hullInputPatchId);
+        hullMainInputPatchParam = tempVar;
+      } else if (shaderModel.IsDS() &&
+                 TypeTranslator::isOutputPatch(param->getType())) {
+        // OutputPatch is the output of the hull shader and an input to the
+        // domain shader.
+        const uint32_t hullOutputPatchId =
+            declIdMapper.createStageVarWithoutSemantics(
+                /*isInput*/ true, typeId, "hullShaderOutput",
+                decl->getAttr<VKLocationAttr>());
+        loadedValue = theBuilder.createLoad(typeId, hullOutputPatchId);
+      } else if (!declIdMapper.createStageInputVar(param, &loadedValue,
+                                                   /*isPC*/ false)) {
         return false;
+      }
+
+      // SV_DomainLocation refers to a float2 (u,v), whereas TessCoord is a
+      // float3 (u,v,w). To ensure SPIR-V validity, a float3 stage variable is
+      // created, and we must extract a float2 from it before passing it to the
+      // main function.
+      if (hasSemantic(param, hlsl::DXIL::SemanticKind::DomainLocation) &&
+          hlsl::GetHLSLVecSize(param->getType()) == 2) {
+        loadedValue = theBuilder.createVectorShuffle(typeId, loadedValue,
+                                                     loadedValue, {0, 1});
+      }
 
       theBuilder.createStore(tempVar, loadedValue);
+
+      if (hasSemantic(param, hlsl::DXIL::SemanticKind::OutputControlPointID))
+        outputControlPointIdVal = loadedValue;
+      if (hasSemantic(param, hlsl::DXIL::SemanticKind::PrimitiveID))
+        primitiveIdVar = tempVar;
     }
   }
 
@@ -4664,11 +5398,24 @@ bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
   const uint32_t retVal =
       theBuilder.createFunctionCall(retType, entryFuncId, params);
 
-  // Create and write stage output variables for return value
-  if (!declIdMapper.createStageOutputVar(decl, retVal))
-    return false;
+  // Create and write stage output variables for return value. Special case for
+  // Hull shaders since they operate differently in 2 ways:
+  // 1- Their return value is in fact an array and each invocation should write
+  // to the proper offset in the array.
+  // 2- The patch constant function must be called *once* after all invocations
+  // of the main entry point function is done.
+  if (shaderModel.IsHS()) {
+    if (!processHullEntryPointOutputAndPatchConstFunc(
+            decl, retType, retVal, numOutputControlPoints,
+            outputControlPointIdVal, primitiveIdVar, hullMainInputPatchParam))
+      return false;
+  } else {
+    if (!declIdMapper.createStageOutputVar(decl, retVal, /*isPC*/ false))
+      return false;
+  }
 
-  // Create and write stage output variables for parameters marked as out/inout
+  // Create and write stage output variables for parameters marked as
+  // out/inout
   for (uint32_t i = 0; i < decl->getNumParams(); ++i) {
     const auto *param = decl->getParamDecl(i);
     if (param->getAttr<HLSLOutAttr>() || param->getAttr<HLSLInOutAttr>()) {
@@ -4676,7 +5423,8 @@ bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
       const uint32_t typeId = typeTranslator.translateType(param->getType());
       const uint32_t loadedParam = theBuilder.createLoad(typeId, params[i]);
 
-      if (!declIdMapper.createStageOutputVar(param, loadedParam))
+      if (!declIdMapper.createStageOutputVar(param, loadedParam,
+                                             /*isPC*/ false))
         return false;
     }
   }
@@ -4684,6 +5432,133 @@ bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
   theBuilder.createReturn();
   theBuilder.endFunction();
 
+  // For Hull shaders, there is no explicit call to the PCF in the HLSL source.
+  // We should invoke a translation of the PCF manually.
+  if (shaderModel.IsHS())
+    doDecl(patchConstFunc);
+
+  return true;
+}
+
+bool SPIRVEmitter::processHullEntryPointOutputAndPatchConstFunc(
+    const FunctionDecl *hullMainFuncDecl, uint32_t retType, uint32_t retVal,
+    uint32_t numOutputControlPoints, uint32_t outputControlPointId,
+    uint32_t primitiveId, uint32_t hullMainInputPatch) {
+
+  // This method may only be called for Hull shaders.
+  assert(shaderModel.IsHS());
+  uint32_t hullMainOutputPatch = 0;
+
+  // For Hull shaders, the real output is an array of size
+  // numOutputControlPoints. The results of the main should be written to the
+  // correct offset in the array (based on InvocationID).
+  if (!numOutputControlPoints) {
+    emitError("number of output control points cannot be zero",
+              hullMainFuncDecl->getLocation());
+    return false;
+  }
+  // TODO: We should be able to handle cases where the SV_OutputControlPointID
+  // is not provided.
+  if (!outputControlPointId) {
+    emitError(
+        "SV_OutputControlPointID semantic must be provided in the hull shader",
+        hullMainFuncDecl->getLocation());
+    return false;
+  }
+  if (!patchConstFunc) {
+    emitError("patch constant function not defined in hull shader",
+              hullMainFuncDecl->getLocation());
+    return false;
+  }
+
+  // Let's call the return value of the Hull entry point function
+  // "hllEntryPointOutput". The type of hullEntryPointOutput should be an
+  // array of size numOutputControlPoints.
+  const uint32_t hullEntryPointOutputType = theBuilder.getArrayType(
+      retType, theBuilder.getConstantUint32(numOutputControlPoints));
+  const auto loc = hullMainFuncDecl->getAttr<VKLocationAttr>();
+  const auto hullOutputVar = declIdMapper.createStageVarWithoutSemantics(
+      /*isInput*/ false, hullEntryPointOutputType, "hullEntryPointOutput", loc);
+  if (!hullOutputVar)
+    return false;
+
+  // Write the results into the correct Output array offset.
+  const auto location = theBuilder.createAccessChain(
+      theBuilder.getPointerType(retType, spv::StorageClass::Output),
+      hullOutputVar, {outputControlPointId});
+  theBuilder.createStore(location, retVal);
+
+  // If the patch constant function (PCF) takes the result of the Hull main
+  // entry point, create a temporary function-scope variable and write the
+  // results to it, so it can be passed to the PCF.
+  if (patchConstFuncTakesHullOutputPatch(patchConstFunc)) {
+    hullMainOutputPatch = theBuilder.addFnVar(hullEntryPointOutputType,
+                                              "temp.var.hullEntryPointOutput");
+    const auto tempLocation = theBuilder.createAccessChain(
+        theBuilder.getPointerType(retType, spv::StorageClass::Function),
+        hullMainOutputPatch, {outputControlPointId});
+    theBuilder.createStore(tempLocation, retVal);
+  }
+
+  // Now create a barrier before calling the Patch Constant Function (PCF).
+  // Flags are:
+  // Execution Barrier scope = Workgroup (2)
+  // Memory Barrier scope = Device (1)
+  // Memory Semantics Barrier scope = None (0)
+  theBuilder.createControlBarrier(theBuilder.getConstantUint32(2),
+                                  theBuilder.getConstantUint32(1),
+                                  theBuilder.getConstantUint32(0));
+
+  // The PCF should be called only once. Therefore, we check the invocationID,
+  // and we only allow ID 0 to call the PCF.
+  const uint32_t condition = theBuilder.createBinaryOp(
+      spv::Op::OpIEqual, theBuilder.getBoolType(), outputControlPointId,
+      theBuilder.getConstantUint32(0));
+  const uint32_t thenBB = theBuilder.createBasicBlock("if.true");
+  const uint32_t mergeBB = theBuilder.createBasicBlock("if.merge");
+  theBuilder.createConditionalBranch(condition, thenBB, mergeBB, mergeBB);
+  theBuilder.addSuccessor(thenBB);
+  theBuilder.addSuccessor(mergeBB);
+  theBuilder.setMergeTarget(mergeBB);
+
+  theBuilder.setInsertPoint(thenBB);
+  // Call the PCF. Since the function is not explicitly called, we must first
+  // register an ID for it.
+  const uint32_t pcfId = declIdMapper.getOrRegisterFnResultId(patchConstFunc);
+  const uint32_t pcfRetType =
+      typeTranslator.translateType(patchConstFunc->getReturnType());
+  std::vector<uint32_t> pcfParams;
+  for (const auto *param : patchConstFunc->parameters()) {
+    // Note: According to the HLSL reference, the PCF takes an InputPatch of
+    // ControlPoints as well as the PatchID (PrimitiveID). This does not
+    // necessarily mean that they are present. There is also no requirement
+    // for the order of parameters passed to PCF.
+    if (TypeTranslator::isInputPatch(param->getType()))
+      pcfParams.push_back(hullMainInputPatch);
+    if (TypeTranslator::isOutputPatch(param->getType()))
+      pcfParams.push_back(hullMainOutputPatch);
+    if (hasSemantic(param, hlsl::DXIL::SemanticKind::PrimitiveID)) {
+      if (!primitiveId) {
+        const uint32_t typeId = typeTranslator.translateType(param->getType());
+        std::string tempVarName = "param.var." + param->getNameAsString();
+        const uint32_t tempVar = theBuilder.addFnVar(typeId, tempVarName);
+        uint32_t loadedValue = 0;
+        declIdMapper.createStageInputVar(param, &loadedValue, /*isPC*/ true);
+        theBuilder.createStore(tempVar, loadedValue);
+        primitiveId = tempVar;
+      }
+      pcfParams.push_back(primitiveId);
+    }
+  }
+  const uint32_t pcfResultId =
+      theBuilder.createFunctionCall(pcfRetType, pcfId, {pcfParams});
+  if (!declIdMapper.createStageOutputVar(patchConstFunc, pcfResultId,
+                                         /*isPC*/ true))
+    return false;
+
+  theBuilder.createBranch(mergeBB);
+  theBuilder.addSuccessor(mergeBB);
+  theBuilder.setInsertPoint(mergeBB);
   return true;
 }
 
