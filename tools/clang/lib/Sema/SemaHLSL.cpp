@@ -7697,6 +7697,7 @@ void HLSLExternalSource::CheckBinOpForHLSL(
   case BO_ShlAssign:
   case BO_ShrAssign:
   case BO_SubAssign:
+  case BO_OrAssign:
   case BO_XorAssign: {
     extern bool CheckForModifiableLvalue(Expr * E, SourceLocation Loc,
                                          Sema & S);
@@ -7834,12 +7835,16 @@ void HLSLExternalSource::CheckBinOpForHLSL(
     // element kind may be taken from one side and the dimensions from the
     // other.
 
-    // Legal dimension combinations are identical, splat, and truncation.
-    // ResultTy will be set to whichever type can be converted to, if legal,
-    // with preference for leftType if both are possible.
-    if (FAILED(CombineDimensions(leftType, rightType, &ResultTy))) {
-      m_sema->Diag(OpLoc, diag::err_hlsl_type_mismatch);
-      return;
+    if (!isCompoundAssignment) {
+      // Legal dimension combinations are identical, splat, and truncation.
+      // ResultTy will be set to whichever type can be converted to, if legal,
+      // with preference for leftType if both are possible.
+      if (FAILED(CombineDimensions(leftType, rightType, &ResultTy))) {
+        m_sema->Diag(OpLoc, diag::err_hlsl_type_mismatch);
+        return;
+      }
+    } else {
+      ResultTy = LHS.get()->getType();
     }
 
     // Here, element kind is combined with dimensions for computation type.
@@ -9883,10 +9888,13 @@ static void ValidateAttributeOnSwitchOrIf(Sema& S, Stmt* St, const AttributeList
   }
 }
 
-static StringRef ValidateAttributeStringArg(Sema& S, const AttributeList &A, _In_opt_z_ const char* values)
+static StringRef ValidateAttributeStringArg(Sema& S, const AttributeList &A, _In_opt_z_ const char* values, unsigned index = 0)
 {
   // values is an optional comma-separated list of potential values.
-  Expr* E = A.getArgAsExpr(0);
+  if (A.getNumArgs() <= index)
+    return StringRef();
+
+  Expr* E = A.getArgAsExpr(index);
   if (E->isTypeDependent() || E->isValueDependent() || E->getStmtClass() != Stmt::StringLiteralClass)
   {
     S.Diag(E->getLocStart(), diag::err_hlsl_attribute_expects_string_literal)
@@ -10145,9 +10153,14 @@ void hlsl::HandleDeclAttributeForHLSL(Sema &S, Decl *D, const AttributeList &A, 
         A.getAttributeSpellingListIndex());
     break;
   case AttributeList::AT_HLSLMaxVertexCount:
-	  declAttr = ::new (S.Context) HLSLMaxVertexCountAttr(A.getRange(), S.Context,
-		  ValidateAttributeIntArg(S, A), A.getAttributeSpellingListIndex());
-	  break;
+    declAttr = ::new (S.Context) HLSLMaxVertexCountAttr(A.getRange(), S.Context,
+      ValidateAttributeIntArg(S, A), A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_HLSLExperimental:
+    declAttr = ::new (S.Context) HLSLExperimentalAttr(A.getRange(), S.Context,
+      ValidateAttributeStringArg(S, A, nullptr, 0), ValidateAttributeStringArg(S, A, nullptr, 1),
+      A.getAttributeSpellingListIndex());
+    break;
   default:
     Handled = false;
     break;  // SPIRV Change: was return;
@@ -11205,7 +11218,16 @@ void hlsl::CustomPrintHLSLAttr(const clang::Attr *A, llvm::raw_ostream &Out, con
     Out << "[shader(\"" << ACast->getStage() << "\")]\n";
     break;
   }
-  
+
+  case clang::attr::HLSLExperimental:
+  {
+    Attr * noconst = const_cast<Attr*>(A);
+    HLSLExperimentalAttr *ACast = static_cast<HLSLExperimentalAttr*>(noconst);
+    Indent(Indentation, Out);
+    Out << "[experimental(\"" << ACast->getName() << "\", \"" << ACast->getValue() << "\")]\n";
+    break;
+  }
+
   case clang::attr::HLSLMaxVertexCount:
   {
     Attr * noconst = const_cast<Attr*>(A);

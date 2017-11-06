@@ -877,6 +877,22 @@ Casting between (vectors) of scalar types is translated according to the followi
 |   Float    |                   | ``OpConvertFToS`` | ``OpConvertFToU`` |      no-op        |
 +------------+-------------------+-------------------+-------------------+-------------------+
 
+It is also feasible in HLSL to cast a float matrix to another float matrix with a smaller size.
+This is known as matrix truncation cast. For instance, the following code casts a 3x4 matrix
+into a 2x3 matrix.
+
+.. code:: hlsl
+
+  float3x4 m = { 1,  2,  3, 4,
+                 5,  6,  7, 8,
+                 9, 10, 11, 12 };
+
+  float2x3 a = (float2x3)m;
+
+Such casting takes the upper-left most corner of the original matrix to generate the result.
+In the above example, matrix ``a`` will have 2 rows, with 3 columns each. First row will be
+``1, 2, 3`` and the second row will be ``5, 6, 7``.
+
 Indexing operator
 -----------------
 
@@ -1137,6 +1153,9 @@ extended instruction mapping, so they are handled with additional steps:
   conversion into integer matrices.
 - ``asuint``: converts the component type of a scalar/vector/matrix from float
   or int into uint. Uses ``OpBitcast``. This method currently does not support
+- ``asuint``: Converts a double into two 32-bit unsigned integers. Uses SPIR-V ``OpBitCast``.
+- ``asdouble``: Converts two 32-bit unsigned integers into a double, or four 32-bit unsigned
+  integers into two doubles. Uses SPIR-V ``OpVectorShuffle`` and ``OpBitCast``.
   conversion into unsigned integer matrices.
 - ``isfinite`` : Determines if the specified value is finite. Since ``OpIsFinite``
   requires the ``Kernel`` capability, translation is done using ``OpIsNan`` and
@@ -1145,11 +1164,14 @@ extended instruction mapping, so they are handled with additional steps:
   Uses conditional control flow as well as SPIR-V ``OpKill``.
 - ``rcp``: Calculates a fast, approximate, per-component reciprocal.
   Uses SIR-V ``OpFDiv``.
+- ``lit``: Returns a lighting coefficient vector. This vector is a float4 with
+  components of (ambient, diffuse, specular, 1). How ``diffuse`` and ``specular``
+  are calculated are explained `here <https://msdn.microsoft.com/en-us/library/windows/desktop/bb509619(v=vs.85).aspx>`_.
 
 Using SPIR-V opcode
 ~~~~~~~~~~~~~~~~~~~
 
-the following intrinsic HLSL functions have direct SPIR-V opcodes for them:
+The following intrinsic HLSL functions have direct SPIR-V opcodes for them:
 
 ============================== =================================
    HLSL Intrinsic Function              SPIR-V Opcode
@@ -1181,7 +1203,7 @@ the following intrinsic HLSL functions have direct SPIR-V opcodes for them:
 Using GLSL extended instructions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-the following intrinsic HLSL functions are translated using their equivalent
+The following intrinsic HLSL functions are translated using their equivalent
 instruction in the `GLSL extended instruction set <https://www.khronos.org/registry/spir-v/specs/1.0/GLSL.std.450.html>`_.
 
 ======================= ===================================

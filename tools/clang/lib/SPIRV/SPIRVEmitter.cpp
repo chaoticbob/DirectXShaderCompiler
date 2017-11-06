@@ -44,7 +44,7 @@ bool hasSemantic(const DeclaratorDecl *decl,
 
 bool patchConstFuncTakesHullOutputPatch(FunctionDecl *pcf) {
   for (const auto *param : pcf->parameters())
-    if (TypeTranslator::isOutputPatch(param->getType()))
+    if (hlsl::IsHLSLOutputPatchType(param->getType()))
       return true;
   return false;
 }
@@ -1339,6 +1339,13 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
   switch (expr->getCastKind()) {
   case CastKind::CK_LValueToRValue: {
     auto info = doExpr(subExpr);
+
+    // There are cases where the AST includes incorrect LValueToRValue nodes in
+    // the tree where not necessary. To make sure we emit the correct SPIR-V, we
+    // should bypass such casts.
+    if (subExpr->IgnoreParenNoopCasts(astContext)->isRValue())
+      return info;
+
     if (isVectorShuffle(subExpr) || isa<ExtMatrixElementExpr>(subExpr) ||
         isBufferTextureIndexing(dyn_cast<CXXOperatorCallExpr>(subExpr)) ||
         isTextureMipsSampleIndexing(dyn_cast<CXXOperatorCallExpr>(subExpr))) {
@@ -1466,6 +1473,57 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
       return theBuilder.createCompositeConstruct(matType, vectors);
     }
   }
+  case CastKind::CK_HLSLMatrixTruncationCast: {
+    const QualType srcType = subExpr->getType();
+    const uint32_t srcId = doExpr(subExpr);
+    const QualType elemType = hlsl::GetHLSLMatElementType(srcType);
+    const uint32_t dstTypeId = typeTranslator.translateType(toType);
+    llvm::SmallVector<uint32_t, 4> indexes;
+
+    // It is possible that the source matrix is in fact a vector.
+    // For example: Truncate float1x3 --> float1x2.
+    // The front-end disallows float1x3 --> float2x1.
+    {
+      uint32_t srcVecSize = 0, dstVecSize = 0;
+      if (TypeTranslator::isVectorType(srcType, nullptr, &srcVecSize) &&
+          TypeTranslator::isVectorType(toType, nullptr, &dstVecSize)) {
+        for (uint32_t i = 0; i < dstVecSize; ++i)
+          indexes.push_back(i);
+        return theBuilder.createVectorShuffle(dstTypeId, srcId, srcId, indexes);
+      }
+    }
+
+    uint32_t srcRows = 0, srcCols = 0, dstRows = 0, dstCols = 0;
+    hlsl::GetHLSLMatRowColCount(srcType, srcRows, srcCols);
+    hlsl::GetHLSLMatRowColCount(toType, dstRows, dstCols);
+    const uint32_t elemTypeId = typeTranslator.translateType(elemType);
+    const uint32_t srcRowType = theBuilder.getVecType(elemTypeId, srcCols);
+
+    // Indexes to pass to OpVectorShuffle
+    for (uint32_t i = 0; i < dstCols; ++i)
+      indexes.push_back(i);
+
+    llvm::SmallVector<uint32_t, 4> extractedVecs;
+    for (uint32_t row = 0; row < dstRows; ++row) {
+      // Extract a row
+      uint32_t rowId =
+          theBuilder.createCompositeExtract(srcRowType, srcId, {row});
+      // Extract the necessary columns from that row.
+      // The front-end ensures dstCols <= srcCols.
+      // If dstCols equals srcCols, we can use the whole row directly.
+      if (dstCols == 1) {
+        rowId = theBuilder.createCompositeExtract(elemTypeId, rowId, {0});
+      } else if (dstCols < srcCols) {
+        rowId = theBuilder.createVectorShuffle(
+            theBuilder.getVecType(elemTypeId, dstCols), rowId, rowId, indexes);
+      }
+      extractedVecs.push_back(rowId);
+    }
+    if (extractedVecs.size() == 1)
+      return extractedVecs.front();
+    return theBuilder.createCompositeConstruct(
+        typeTranslator.translateType(toType), extractedVecs);
+  }
   case CastKind::CK_HLSLMatrixToScalarCast: {
     // The underlying should already be a matrix of 1x1.
     assert(TypeTranslator::is1x1Matrix(subExpr->getType()));
@@ -1480,12 +1538,132 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
   case CastKind::CK_FunctionToPointerDecay:
     // Just need to return the function id
     return doExpr(subExpr);
+  case CastKind::CK_FlatConversion: {
+    // Optimization: we can use OpConstantNull for cases where we want to
+    // initialize an entire data structure to zeros.
+    llvm::APSInt intValue;
+    if (subExpr->EvaluateAsInt(intValue, astContext, Expr::SE_NoSideEffects) &&
+        intValue.getExtValue() == 0) {
+      return theBuilder.getConstantNull(typeTranslator.translateType(toType));
+    } else {
+      return processFlatConversion(toType, subExpr->getType(), doExpr(subExpr));
+    }
+  }
   default:
-    emitError("ImplictCast Kind '%0' is not supported yet.")
-        << expr->getCastKindName();
+    emitError("ImplictCast Kind '%0' is not supported yet.",
+              expr->getLocStart())
+        << expr->getCastKindName() << expr->getSourceRange();
     expr->dump();
     return 0;
   }
+}
+
+uint32_t SPIRVEmitter::processFlatConversion(const QualType type,
+                                             const QualType initType,
+                                             const uint32_t initId) {
+  // Try to translate the canonical type first
+  const auto canonicalType = type.getCanonicalType();
+  if (canonicalType != type)
+    return processFlatConversion(canonicalType, initType, initId);
+
+  // Primitive types
+  {
+    QualType ty = {};
+    if (TypeTranslator::isScalarType(type, &ty)) {
+      if (const auto *builtinType = ty->getAs<BuiltinType>()) {
+        switch (builtinType->getKind()) {
+        case BuiltinType::Void: {
+          emitError("cannot create a constant of void type");
+          return 0;
+        }
+        case BuiltinType::Bool:
+          return castToBool(initId, initType, ty);
+        // int, min16int (short), and min12int are all translated to 32-bit
+        // signed integers in SPIR-V.
+        case BuiltinType::Int:
+        case BuiltinType::Short:
+        case BuiltinType::Min12Int:
+        case BuiltinType::UShort:
+        case BuiltinType::UInt:
+          return castToInt(initId, initType, ty);
+        // float, min16float (half), and min10float are all translated to
+        // 32-bit float in SPIR-V.
+        case BuiltinType::Float:
+        case BuiltinType::Half:
+        case BuiltinType::Min10Float:
+          return castToFloat(initId, initType, ty);
+        default:
+          emitError("flat conversion of type %0 unimplemented")
+              << builtinType->getTypeClassName();
+          return 0;
+        }
+      }
+    }
+  }
+  // Vector types
+  {
+    QualType elemType = {};
+    uint32_t elemCount = {};
+    if (TypeTranslator::isVectorType(type, &elemType, &elemCount)) {
+      const uint32_t elemId = processFlatConversion(elemType, initType, initId);
+      llvm::SmallVector<uint32_t, 4> constituents(size_t(elemCount), elemId);
+      return theBuilder.createCompositeConstruct(
+          typeTranslator.translateType(type), constituents);
+    }
+  }
+
+  // Matrix types
+  {
+    QualType elemType = {};
+    uint32_t rowCount = 0, colCount = 0;
+    if (TypeTranslator::isMxNMatrix(type, &elemType, &rowCount, &colCount)) {
+      if (!elemType->isFloatingType()) {
+        emitError("non-floating-point matrix type unimplemented");
+        return 0;
+      }
+
+      // By default HLSL matrices are row major, while SPIR-V matrices are
+      // column major. We are mapping what HLSL semantically mean a row into a
+      // column here.
+      const uint32_t vecType = theBuilder.getVecType(
+          typeTranslator.translateType(elemType), colCount);
+      const uint32_t elemId = processFlatConversion(elemType, initType, initId);
+      const llvm::SmallVector<uint32_t, 4> constituents(size_t(colCount),
+                                                        elemId);
+      const uint32_t colId =
+          theBuilder.createCompositeConstruct(vecType, constituents);
+      const llvm::SmallVector<uint32_t, 4> rows(size_t(rowCount), colId);
+      return theBuilder.createCompositeConstruct(
+          typeTranslator.translateType(type), rows);
+    }
+  }
+
+  // Struct type
+  if (const auto *structType = type->getAs<RecordType>()) {
+    const auto *decl = structType->getDecl();
+    llvm::SmallVector<uint32_t, 4> fields;
+    for (const auto *field : decl->fields())
+      fields.push_back(
+          processFlatConversion(field->getType(), initType, initId));
+    return theBuilder.createCompositeConstruct(
+        typeTranslator.translateType(type), fields);
+  }
+
+  // Array type
+  if (const auto *arrayType = astContext.getAsConstantArrayType(type)) {
+    const auto size =
+        static_cast<uint32_t>(arrayType->getSize().getZExtValue());
+    const uint32_t elemId =
+        processFlatConversion(arrayType->getElementType(), initType, initId);
+    llvm::SmallVector<uint32_t, 4> constituents(size_t(size), elemId);
+    return theBuilder.createCompositeConstruct(
+        typeTranslator.translateType(type), constituents);
+  }
+
+  emitError("flat conversion of type %0 unimplemented")
+      << type->getTypeClassName();
+  type->dump();
+  return 0;
 }
 
 SpirvEvalInfo
@@ -3793,6 +3971,31 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
   case hlsl::IntrinsicOp::IOP_InterlockedCompareStore:
   case hlsl::IntrinsicOp::IOP_InterlockedCompareExchange:
     return processIntrinsicInterlockedMethod(callExpr, hlslOpcode);
+  case hlsl::IntrinsicOp::IOP_tex1D:
+  case hlsl::IntrinsicOp::IOP_tex1Dbias:
+  case hlsl::IntrinsicOp::IOP_tex1Dgrad:
+  case hlsl::IntrinsicOp::IOP_tex1Dlod:
+  case hlsl::IntrinsicOp::IOP_tex1Dproj:
+  case hlsl::IntrinsicOp::IOP_tex2D:
+  case hlsl::IntrinsicOp::IOP_tex2Dbias:
+  case hlsl::IntrinsicOp::IOP_tex2Dgrad:
+  case hlsl::IntrinsicOp::IOP_tex2Dlod:
+  case hlsl::IntrinsicOp::IOP_tex2Dproj:
+  case hlsl::IntrinsicOp::IOP_tex3D:
+  case hlsl::IntrinsicOp::IOP_tex3Dbias:
+  case hlsl::IntrinsicOp::IOP_tex3Dgrad:
+  case hlsl::IntrinsicOp::IOP_tex3Dlod:
+  case hlsl::IntrinsicOp::IOP_tex3Dproj:
+  case hlsl::IntrinsicOp::IOP_texCUBE:
+  case hlsl::IntrinsicOp::IOP_texCUBEbias:
+  case hlsl::IntrinsicOp::IOP_texCUBEgrad:
+  case hlsl::IntrinsicOp::IOP_texCUBElod:
+  case hlsl::IntrinsicOp::IOP_texCUBEproj: {
+    emitError("deprecated intrinsic %0 function will not be not supported",
+              callExpr->getExprLoc())
+        << callee->getName();
+    return 0;
+  }
   case hlsl::IntrinsicOp::IOP_dot:
     return processIntrinsicDot(callExpr);
   case hlsl::IntrinsicOp::IOP_mul:
@@ -3801,6 +4004,7 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     return processIntrinsicAllOrAny(callExpr, spv::Op::OpAll);
   case hlsl::IntrinsicOp::IOP_any:
     return processIntrinsicAllOrAny(callExpr, spv::Op::OpAny);
+  case hlsl::IntrinsicOp::IOP_asdouble:
   case hlsl::IntrinsicOp::IOP_asfloat:
   case hlsl::IntrinsicOp::IOP_asint:
   case hlsl::IntrinsicOp::IOP_asuint:
@@ -3813,6 +4017,8 @@ uint32_t SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     return processIntrinsicClamp(callExpr);
   case hlsl::IntrinsicOp::IOP_frexp:
     return processIntrinsicFrexp(callExpr);
+  case hlsl::IntrinsicOp::IOP_lit:
+    return processIntrinsicLit(callExpr);
   case hlsl::IntrinsicOp::IOP_modf:
     return processIntrinsicModf(callExpr);
   case hlsl::IntrinsicOp::IOP_sign: {
@@ -4114,6 +4320,37 @@ uint32_t SPIRVEmitter::processIntrinsicModf(const CallExpr *callExpr) {
 
   emitError("Unknown argument type passed to Modf function.");
   return 0;
+}
+
+uint32_t SPIRVEmitter::processIntrinsicLit(const CallExpr *callExpr) {
+  // Signature is: float4 lit(float n_dot_l, float n_dot_h, float m)
+  //
+  // This function returns a lighting coefficient vector
+  // (ambient, diffuse, specular, 1) where:
+  // ambient  = 1.
+  // diffuse  = (n_dot_l < 0) ? 0 : n_dot_l
+  // specular = (n_dot_l < 0 || n_dot_h < 0) ? 0 : ((n_dot_h) * m)
+  const uint32_t glslInstSetId = theBuilder.getGLSLExtInstSet();
+  const uint32_t nDotL = doExpr(callExpr->getArg(0));
+  const uint32_t nDotH = doExpr(callExpr->getArg(1));
+  const uint32_t m = doExpr(callExpr->getArg(2));
+  const uint32_t floatType = theBuilder.getFloat32Type();
+  const uint32_t boolType = theBuilder.getBoolType();
+  const uint32_t floatZero = theBuilder.getConstantFloat32(0);
+  const uint32_t floatOne = theBuilder.getConstantFloat32(1);
+  const uint32_t retType = typeTranslator.translateType(callExpr->getType());
+  const uint32_t diffuse = theBuilder.createExtInst(
+      floatType, glslInstSetId, GLSLstd450::GLSLstd450FMax, {floatZero, nDotL});
+  const uint32_t min = theBuilder.createExtInst(
+      floatType, glslInstSetId, GLSLstd450::GLSLstd450FMin, {nDotL, nDotH});
+  const uint32_t isNeg = theBuilder.createBinaryOp(spv::Op::OpFOrdLessThan,
+                                                   boolType, min, floatZero);
+  const uint32_t mul =
+      theBuilder.createBinaryOp(spv::Op::OpFMul, floatType, nDotH, m);
+  const uint32_t specular =
+      theBuilder.createSelect(floatType, isNeg, floatZero, mul);
+  return theBuilder.createCompositeConstruct(
+      retType, {floatOne, diffuse, specular, floatOne});
 }
 
 uint32_t SPIRVEmitter::processIntrinsicFrexp(const CallExpr *callExpr) {
@@ -4630,27 +4867,104 @@ uint32_t SPIRVEmitter::processIntrinsicAllOrAny(const CallExpr *callExpr,
 }
 
 uint32_t SPIRVEmitter::processIntrinsicAsType(const CallExpr *callExpr) {
+  // This function handles 'asint', 'asuint', 'asfloat', and 'asdouble'.
+
+  // Method 1: ret asint(arg)
+  //    arg component type = {float, uint}
+  //    arg template  type = {scalar, vector, matrix}
+  //    ret template  type = same as arg template type.
+  //    ret component type = int
+
+  // Method 2: ret asuint(arg)
+  //    arg component type = {float, int}
+  //    arg template  type = {scalar, vector, matrix}
+  //    ret template  type = same as arg template type.
+  //    ret component type = uint
+
+  // Method 3: ret asfloat(arg)
+  //    arg component type = {float, uint, int}
+  //    arg template  type = {scalar, vector, matrix}
+  //    ret template  type = same as arg template type.
+  //    ret component type = float
+
+  // Method 4: double  asdouble(uint lowbits, uint highbits)
+  // Method 5: double2 asdouble(uint2 lowbits, uint2 highbits)
+  // Method 6:
+  //           void asuint(
+  //           in  double value,
+  //           out uint lowbits,
+  //           out uint highbits
+  //           );
+
   const QualType returnType = callExpr->getType();
+  const uint32_t numArgs = callExpr->getNumArgs();
   const uint32_t returnTypeId = typeTranslator.translateType(returnType);
-  assert(callExpr->getNumArgs() == 1u);
-  const Expr *arg = callExpr->getArg(0);
-  const QualType argType = arg->getType();
+  const Expr *arg0 = callExpr->getArg(0);
+  const QualType argType = arg0->getType();
 
-  // asfloat may take a float or a float vector or a float matrix as argument.
-  // These cases would be a no-op.
+  // Method 3 return type may be the same as arg type, so it would be a no-op.
   if (returnType.getCanonicalType() == argType.getCanonicalType())
-    return doExpr(arg);
+    return doExpr(arg0);
 
-  // SPIR-V does not support non-floating point matrices. So 'asint' and
-  // 'asuint' for MxN matrices are currently not supported.
+  // SPIR-V does not support non-floating point matrices. For the above methods
+  // that involve matrices, either the input or the output is a non-float
+  // matrix. (except for 'asfloat' taking a float matrix and returning a float
+  // matrix, which is a no-op and is handled by the condition above).
   if (TypeTranslator::isMxNMatrix(argType)) {
-    emitError("SPIR-V does not support non-floating point matrices. Thus, "
-              "'asint' and 'asuint' currently do not take matrix arguments.");
+    emitError("non-floating-point matrix type unimplemented",
+              callExpr->getExprLoc());
     return 0;
   }
 
-  return theBuilder.createUnaryOp(spv::Op::OpBitcast, returnTypeId,
-                                  doExpr(arg));
+  switch (numArgs) {
+  case 1: {
+    // Handling Method 1, 2, and 3.
+    return theBuilder.createUnaryOp(spv::Op::OpBitcast, returnTypeId,
+                                    doExpr(arg0));
+  }
+  case 2: {
+    const uint32_t lowbits = doExpr(arg0);
+    const uint32_t highbits = doExpr(callExpr->getArg(1));
+    const uint32_t uintType = theBuilder.getUint32Type();
+    const uint32_t doubleType = theBuilder.getFloat64Type();
+    // Handling Method 4
+    if (argType->isUnsignedIntegerType()) {
+      const uint32_t uintVec2Type = theBuilder.getVecType(uintType, 2);
+      const uint32_t operand = theBuilder.createCompositeConstruct(
+          uintVec2Type, {lowbits, highbits});
+      return theBuilder.createUnaryOp(spv::Op::OpBitcast, doubleType, operand);
+    }
+    // Handling Method 5
+    else {
+      const uint32_t uintVec4Type = theBuilder.getVecType(uintType, 4);
+      const uint32_t doubleVec2Type = theBuilder.getVecType(doubleType, 2);
+      const uint32_t operand = theBuilder.createVectorShuffle(
+          uintVec4Type, lowbits, highbits, {0, 2, 1, 3});
+      return theBuilder.createUnaryOp(spv::Op::OpBitcast, doubleVec2Type,
+                                      operand);
+    }
+  }
+  case 3: {
+    // Handling Method 6.
+    const uint32_t value = doExpr(arg0);
+    const uint32_t lowbits = doExpr(callExpr->getArg(1));
+    const uint32_t highbits = doExpr(callExpr->getArg(2));
+    const uint32_t uintType = theBuilder.getUint32Type();
+    const uint32_t uintVec2Type = theBuilder.getVecType(uintType, 2);
+    const uint32_t vecResult =
+        theBuilder.createUnaryOp(spv::Op::OpBitcast, uintVec2Type, value);
+    theBuilder.createStore(
+        lowbits, theBuilder.createCompositeExtract(uintType, vecResult, {0}));
+    theBuilder.createStore(
+        highbits, theBuilder.createCompositeExtract(uintType, vecResult, {1}));
+    return 0;
+  }
+  default:
+    emitError("unrecognized signature for intrinsic function %0",
+              callExpr->getExprLoc())
+        << callExpr->getDirectCallee()->getName();
+    return 0;
+  }
 }
 
 uint32_t SPIRVEmitter::processIntrinsicIsFinite(const CallExpr *callExpr) {
@@ -5352,8 +5666,7 @@ bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
                             hlsl::IsHLSLStreamOutputType(param->getType());
     if (!param->hasAttr<HLSLOutAttr>() && !isGSOutputStream) {
       uint32_t loadedValue = 0;
-      if (shaderModel.IsHS() &&
-          TypeTranslator::isInputPatch(param->getType())) {
+      if (shaderModel.IsHS() && hlsl::IsHLSLInputPatchType(param->getType())) {
         const uint32_t hullInputPatchId =
             declIdMapper.createStageVarWithoutSemantics(
                 /*isInput*/ true, typeId, "hullEntryPointInput",
@@ -5361,7 +5674,7 @@ bool SPIRVEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
         loadedValue = theBuilder.createLoad(typeId, hullInputPatchId);
         hullMainInputPatchParam = tempVar;
       } else if (shaderModel.IsDS() &&
-                 TypeTranslator::isOutputPatch(param->getType())) {
+                 hlsl::IsHLSLOutputPatchType(param->getType())) {
         // OutputPatch is the output of the hull shader and an input to the
         // domain shader.
         const uint32_t hullOutputPatchId =
@@ -5533,9 +5846,9 @@ bool SPIRVEmitter::processHullEntryPointOutputAndPatchConstFunc(
     // ControlPoints as well as the PatchID (PrimitiveID). This does not
     // necessarily mean that they are present. There is also no requirement
     // for the order of parameters passed to PCF.
-    if (TypeTranslator::isInputPatch(param->getType()))
+    if (hlsl::IsHLSLInputPatchType(param->getType()))
       pcfParams.push_back(hullMainInputPatch);
-    if (TypeTranslator::isOutputPatch(param->getType()))
+    if (hlsl::IsHLSLOutputPatchType(param->getType()))
       pcfParams.push_back(hullMainOutputPatch);
     if (hasSemantic(param, hlsl::DXIL::SemanticKind::PrimitiveID)) {
       if (!primitiveId) {

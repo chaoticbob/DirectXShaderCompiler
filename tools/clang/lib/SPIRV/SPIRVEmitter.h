@@ -263,6 +263,9 @@ private:
   /// Processes the 'frexp' intrinsic function.
   uint32_t processIntrinsicFrexp(const CallExpr *);
 
+  /// Processes the 'lit' intrinsic function.
+  uint32_t processIntrinsicLit(const CallExpr *);
+
   /// Processes the 'modf' intrinsic function.
   uint32_t processIntrinsicModf(const CallExpr *);
 
@@ -344,6 +347,13 @@ private:
   /// vector of size M or N; if a MxN matrix is given, the returned value
   /// one will be a vector of size N.
   uint32_t getMatElemValueOne(QualType type);
+
+private:
+  /// \brief Performs a FlatConversion implicit cast. Fills an instance of the
+  /// given type with initializer <result-id>. The initializer is of type
+  /// initType.
+  uint32_t processFlatConversion(const QualType type, const QualType initType,
+                                 uint32_t initId);
 
 private:
   /// Translates the given frontend APValue into its SPIR-V equivalent for the
