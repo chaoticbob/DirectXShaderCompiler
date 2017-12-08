@@ -410,7 +410,7 @@ CGMSHLSLRuntime::CGMSHLSLRuntime(CodeGenModule &CGM)
   DXVERIFY_NOMSG(globalCBIndex == m_pHLModule->AddCBuffer(std::move(CB)));
 
   // set Float Denorm Mode
-  m_pHLModule->SetFPDenormMode(CGM.getCodeGenOpts().HLSLFlushFPDenorm);
+  m_pHLModule->SetFloat32DenormMode(CGM.getCodeGenOpts().HLSLFloat32DenormMode);
 
 }
 
@@ -568,7 +568,9 @@ static unsigned AlignBaseOffset(unsigned baseOffset, unsigned size,
     if (BT->getKind() == clang::BuiltinType::Kind::Double ||
       BT->getKind() == clang::BuiltinType::Kind::LongLong)
       scalarSizeInBytes = 8;
-    else if (BT->getKind() == clang::BuiltinType::Kind::Half)
+    else if (BT->getKind() == clang::BuiltinType::Kind::Half ||
+      BT->getKind() == clang::BuiltinType::Kind::Short ||
+      BT->getKind() == clang::BuiltinType::Kind::UShort)
       scalarSizeInBytes = 2;
   }
 
@@ -1135,6 +1137,15 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
     return;
   }
 
+  if (m_pHLModule->GetFloat32DenormMode() == DXIL::Float32DenormMode::FTZ) {
+    F->addFnAttr(DXIL::kFP32DenormKindString, DXIL::kFP32DenormValueFtzString);
+  }
+  else if (m_pHLModule->GetFloat32DenormMode() == DXIL::Float32DenormMode::Preserve) {
+    F->addFnAttr(DXIL::kFP32DenormKindString, DXIL::kFP32DenormValuePreserveString);
+  }
+  else if (m_pHLModule->GetFloat32DenormMode() == DXIL::Float32DenormMode::Any) {
+    F->addFnAttr(DXIL::kFP32DenormKindString, DXIL::kFP32DenormValueAnyString);
+  }
   // Set entry function
   const std::string &entryName = m_pHLModule->GetEntryFunctionName();
   bool isEntry = FD->getNameAsString() == entryName;
@@ -1280,6 +1291,16 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
     isHS = true;
     funcProps->shaderKind = DXIL::ShaderKind::Hull;
     HSEntryPatchConstantFuncAttr[F] = Attr;
+  } else {
+    // TODO: This is a duplicate check. We also have this check in
+    // hlsl::DiagnoseTranslationUnit(clang::Sema*).
+    if (isEntry && SM->IsHS()) {
+      unsigned DiagID = Diags.getCustomDiagID(
+          DiagnosticsEngine::Error,
+          "HS entry point must have the patchconstantfunc attribute");
+      Diags.Report(FD->getLocation(), DiagID);
+      return;
+    }
   }
 
   if (const HLSLOutputControlPointsAttr *Attr =
@@ -1413,7 +1434,7 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
   }
 
   DxilFunctionAnnotation *FuncAnnotation =
-      m_pHLModule->AddFunctionAnnotationWithFPDenormMode(F, m_pHLModule->GetFPDenormMode());
+      m_pHLModule->AddFunctionAnnotation(F);
   bool bDefaultRowMajor = m_pHLModule->GetHLOptions().bDefaultRowMajor;
 
   // Param Info
@@ -3869,7 +3890,7 @@ static void CloneShaderEntry(Function *ShaderF, StringRef EntryName,
 
   // Copy function annotation.
   DxilFunctionAnnotation *shaderAnnot = HLM.GetFunctionAnnotation(ShaderF);
-  DxilFunctionAnnotation *annot = HLM.AddFunctionAnnotationWithFPDenormMode(F, HLM.GetFPDenormMode());
+  DxilFunctionAnnotation *annot = HLM.AddFunctionAnnotation(F);
 
   DxilParameterAnnotation &retAnnot = shaderAnnot->GetRetTypeAnnotation();
   DxilParameterAnnotation &cloneRetAnnot = annot->GetRetTypeAnnotation();
@@ -4054,14 +4075,8 @@ void CGMSHLSLRuntime::SetPatchConstantFunction(const EntryFunctionInfo &EntryFun
 
   auto AttrsIter = HSEntryPatchConstantFuncAttr.find(EntryFunc.Func);
 
-  if (AttrsIter == HSEntryPatchConstantFuncAttr.end()) {
-    DiagnosticsEngine &Diags = CGM.getDiags();
-    unsigned DiagID =
-      Diags.getCustomDiagID(DiagnosticsEngine::Error,
-        "HS entry is missing patchconstantfunc attribute.");
-    Diags.Report(EntryFunc.SL, DiagID);
-    return;
-  }
+  DXASSERT(AttrsIter != HSEntryPatchConstantFuncAttr.end(),
+           "we have checked this in AddHLSLFunctionInfo()");
 
   SetPatchConstantFunctionWithAttr(Entry, AttrsIter->second);
 }
@@ -4083,12 +4098,10 @@ void CGMSHLSLRuntime::SetPatchConstantFunctionWithAttr(
   }
 
   if (Entry->second.NumOverloads != 1) {
-    DXASSERT(false,
-        "hlsl::DiagnoseTranslationUnit used to check for this condition.");
     DiagnosticsEngine &Diags = CGM.getDiags();
     unsigned DiagID =
       Diags.getCustomDiagID(DiagnosticsEngine::Warning,
-        "Multiple functions match patchconstantfunc %0.");
+        "Multiple overloads of patchconstantfunc %0.");
     unsigned NoteID =
       Diags.getCustomDiagID(DiagnosticsEngine::Note,
         "This overload was selected.");
@@ -6047,16 +6060,38 @@ void CGMSHLSLRuntime::EmitHLSLOutParamConversionInit(
     const ParmVarDecl *Param = FD->getParamDecl(i);
     const Expr *Arg = E->getArg(i+ArgsToSkip);
     QualType ParamTy = Param->getType().getNonReferenceType();
-
+    bool RValOnRef = false;
     if (!Param->isModifierOut()) {
-      if (!ParamTy->isAggregateType() || hlsl::IsHLSLMatType(ParamTy))
-        continue;
+      if (!ParamTy->isAggregateType() || hlsl::IsHLSLMatType(ParamTy)) {
+        if (Arg->isRValue() && Param->getType()->isReferenceType()) {
+          // RValue on a reference type.
+          if (const CStyleCastExpr *cCast = dyn_cast<CStyleCastExpr>(Arg)) {
+            // TODO: Evolving this to warn then fail in future language versions.
+            // Allow special case like cast uint to uint for back-compat.
+            if (cCast->getCastKind() == CastKind::CK_NoOp) {
+              if (const ImplicitCastExpr *cast =
+                      dyn_cast<ImplicitCastExpr>(cCast->getSubExpr())) {
+                if (cast->getCastKind() == CastKind::CK_LValueToRValue) {
+                  // update the arg
+                  argList[i] = cast->getSubExpr();
+                  continue;
+                }
+              }
+            }
+          }
+          // EmitLValue will report error.
+          // Mark RValOnRef to create tmpArg for it.
+          RValOnRef = true;
+        } else {
+          continue;
+        }
+      }
     }
 
     // get original arg
     LValue argLV = CGF.EmitLValue(Arg);
 
-    if (!Param->isModifierOut()) {
+    if (!Param->isModifierOut() && !RValOnRef) {
       bool isDefaultAddrSpace = true;
       if (argLV.isSimple()) {
         isDefaultAddrSpace =
