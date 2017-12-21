@@ -306,19 +306,6 @@ inline bool evaluatesToConstZero(const Expr *expr, ASTContext &astContext) {
   return false;
 }
 
-/// Creates an access chain to index into the given SPIR-V evaluation result
-/// and overwrites and returns the new SPIR-V evaluation result.
-inline SpirvEvalInfo &
-turnIntoElementPtr(SpirvEvalInfo &info, QualType elemType,
-                   const llvm::SmallVector<uint32_t, 4> &indices,
-                   ModuleBuilder &builder, TypeTranslator &translator) {
-  assert(!info.isRValue());
-  const uint32_t ptrType = builder.getPointerType(
-      translator.translateType(elemType, info.getLayoutRule()),
-      info.getStorageClass());
-  return info.setResultId(builder.createAccessChain(ptrType, info, indices));
-}
-
 /// Returns the HLSLBufferDecl if the given VarDecl is inside a cbuffer/tbuffer.
 /// Returns nullptr otherwise, including varDecl is a ConstantBuffer or
 /// TextureBuffer itself.
@@ -833,6 +820,16 @@ void SPIRVEmitter::doRecordDecl(const RecordDecl *recordDecl) {
 
 void SPIRVEmitter::doVarDecl(const VarDecl *decl) {
   validateVKAttributes(decl);
+
+  if (decl->hasAttr<HLSLRowMajorAttr>()) {
+    emitWarning("row_major attribute for stand-alone matrix is not supported",
+                decl->getAttr<HLSLRowMajorAttr>()->getLocation());
+  }
+  if (decl->hasAttr<HLSLColumnMajorAttr>()) {
+    emitWarning(
+        "column_major attribute for stand-alone matrix is not supported",
+        decl->getAttr<HLSLColumnMajorAttr>()->getLocation());
+  }
 
   if (decl->hasAttr<VKPushConstantAttr>()) {
     // This is a VarDecl for PushConstant block.
@@ -1440,8 +1437,7 @@ SPIRVEmitter::doArraySubscriptExpr(const ArraySubscriptExpr *expr) {
   auto info = doExpr(collectArrayStructIndices(expr, &indices));
 
   if (!indices.empty()) {
-    (void)turnIntoElementPtr(info, expr->getType(), indices, theBuilder,
-                             typeTranslator);
+    (void)turnIntoElementPtr(info, expr->getType(), indices);
   }
 
   return info;
@@ -1504,88 +1500,100 @@ SpirvEvalInfo SPIRVEmitter::processCall(const CallExpr *callExpr) {
     }
   }
 
-  if (callee) {
-    const auto numParams = callee->getNumParams();
-    bool isNonStaticMemberCall = false;
-
-    llvm::SmallVector<uint32_t, 4> params; // Temporary variables
-    llvm::SmallVector<uint32_t, 4> args;   // Evaluated arguments
-
-    if (const auto *memberCall = dyn_cast<CXXMemberCallExpr>(callExpr)) {
-      isNonStaticMemberCall =
-          !cast<CXXMethodDecl>(memberCall->getCalleeDecl())->isStatic();
-      if (isNonStaticMemberCall) {
-        // For non-static member calls, evaluate the object and pass it as the
-        // first argument.
-        const auto *object = memberCall->getImplicitObjectArgument();
-        args.push_back(doExpr(object));
-        // We do not need to create a new temporary variable for the this
-        // object. Use the evaluated argument.
-        params.push_back(args.back());
-      }
-    }
-
-    // Evaluate parameters
-    for (uint32_t i = 0; i < numParams; ++i) {
-      auto *arg = callExpr->getArg(i);
-      const auto *param = callee->getParamDecl(i);
-
-      // In some cases where pass-by-reference should be done (such as an
-      // 'inout' struct), the AST does not use a reference type in the function
-      // signature. The LValueToRValue implicit cast should therefore be ignored
-      // in these cases.
-      if (canActAsOutParmVar(param) && !param->getType()->isReferenceType())
-        arg = cast<ImplicitCastExpr>(arg)->getSubExpr();
-
-      // We need to create variables for holding the values to be used as
-      // arguments. The variables themselves are of pointer types.
-      const uint32_t varType = typeTranslator.translateType(arg->getType());
-      const std::string varName = "param.var." + param->getNameAsString();
-      const uint32_t tempVarId = theBuilder.addFnVar(varType, varName);
-
-      params.push_back(tempVarId);
-      args.push_back(doExpr(arg));
-
-      if (canActAsOutParmVar(param)) {
-        // The current parameter is marked as out/inout. The argument then is
-        // essentially passed in by reference. We need to load the value
-        // explicitly here since the AST won't inject LValueToRValue implicit
-        // cast for this case.
-        const uint32_t value = theBuilder.createLoad(varType, args.back());
-        theBuilder.createStore(tempVarId, value);
-      } else {
-        theBuilder.createStore(tempVarId, args.back());
-      }
-    }
-
-    // Push the callee into the work queue if it is not there.
-    if (!workQueue.count(callee)) {
-      workQueue.insert(callee);
-    }
-
-    const uint32_t retType = typeTranslator.translateType(callExpr->getType());
-    // Get or forward declare the function <result-id>
-    const uint32_t funcId = declIdMapper.getOrRegisterFnResultId(callee);
-
-    const uint32_t retVal =
-        theBuilder.createFunctionCall(retType, funcId, params);
-
-    // Go through all parameters and write those marked as out/inout
-    for (uint32_t i = 0; i < numParams; ++i) {
-      const auto *param = callee->getParamDecl(i);
-      if (canActAsOutParmVar(param)) {
-        const uint32_t index = i + isNonStaticMemberCall;
-        const uint32_t typeId = typeTranslator.translateType(param->getType());
-        const uint32_t value = theBuilder.createLoad(typeId, params[index]);
-        theBuilder.createStore(args[index], value);
-      }
-    }
-
-    return SpirvEvalInfo(retVal).setRValue();
+  if (!callee) {
+    emitError("calling non-function unimplemented", callExpr->getExprLoc());
+    return 0;
   }
 
-  emitError("calling non-function unimplemented", callExpr->getExprLoc());
-  return 0;
+  const auto numParams = callee->getNumParams();
+  bool isNonStaticMemberCall = false;
+
+  llvm::SmallVector<uint32_t, 4> params; // Temporary variables
+  llvm::SmallVector<uint32_t, 4> args;   // Evaluated arguments
+
+  if (const auto *memberCall = dyn_cast<CXXMemberCallExpr>(callExpr)) {
+    isNonStaticMemberCall =
+        !cast<CXXMethodDecl>(memberCall->getCalleeDecl())->isStatic();
+    if (isNonStaticMemberCall) {
+      // For non-static member calls, evaluate the object and pass it as the
+      // first argument.
+      const auto *object = memberCall->getImplicitObjectArgument();
+      const auto objectEvalInfo = doExpr(object);
+      uint32_t objectId = objectEvalInfo;
+
+      // If not already a variable, we need to create a temporary variable and
+      // pass the object pointer to the function. Example:
+      // getObject().objectMethod();
+      if (objectEvalInfo.isRValue()) {
+        const auto objType = object->getType();
+        objectId = createTemporaryVar(objType, TypeTranslator::getName(objType),
+                                      objectEvalInfo);
+      }
+
+      args.push_back(objectId);
+      // We do not need to create a new temporary variable for the this
+      // object. Use the evaluated argument.
+      params.push_back(args.back());
+    }
+  }
+
+  // Evaluate parameters
+  for (uint32_t i = 0; i < numParams; ++i) {
+    auto *arg = callExpr->getArg(i);
+    const auto *param = callee->getParamDecl(i);
+
+    // In some cases where pass-by-reference should be done (such as an
+    // 'inout' struct), the AST does not use a reference type in the function
+    // signature. The LValueToRValue implicit cast should therefore be ignored
+    // in these cases.
+    if (canActAsOutParmVar(param) && !param->getType()->isReferenceType())
+      arg = cast<ImplicitCastExpr>(arg)->getSubExpr();
+
+    // We need to create variables for holding the values to be used as
+    // arguments. The variables themselves are of pointer types.
+    const uint32_t varType = typeTranslator.translateType(arg->getType());
+    const std::string varName = "param.var." + param->getNameAsString();
+    const uint32_t tempVarId = theBuilder.addFnVar(varType, varName);
+
+    params.push_back(tempVarId);
+    args.push_back(doExpr(arg));
+
+    if (canActAsOutParmVar(param)) {
+      // The current parameter is marked as out/inout. The argument then is
+      // essentially passed in by reference. We need to load the value
+      // explicitly here since the AST won't inject LValueToRValue implicit
+      // cast for this case.
+      const uint32_t value = theBuilder.createLoad(varType, args.back());
+      theBuilder.createStore(tempVarId, value);
+    } else {
+      theBuilder.createStore(tempVarId, args.back());
+    }
+  }
+
+  // Push the callee into the work queue if it is not there.
+  if (!workQueue.count(callee)) {
+    workQueue.insert(callee);
+  }
+
+  const uint32_t retType = typeTranslator.translateType(callExpr->getType());
+  // Get or forward declare the function <result-id>
+  const uint32_t funcId = declIdMapper.getOrRegisterFnResultId(callee);
+
+  const uint32_t retVal =
+      theBuilder.createFunctionCall(retType, funcId, params);
+
+  // Go through all parameters and write those marked as out/inout
+  for (uint32_t i = 0; i < numParams; ++i) {
+    const auto *param = callee->getParamDecl(i);
+    if (canActAsOutParmVar(param)) {
+      const uint32_t index = i + isNonStaticMemberCall;
+      const uint32_t typeId = typeTranslator.translateType(param->getType());
+      const uint32_t value = theBuilder.createLoad(typeId, params[index]);
+      theBuilder.createStore(args[index], value);
+    }
+  }
+
+  return SpirvEvalInfo(retVal).setRValue();
 }
 
 SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
@@ -1608,11 +1616,8 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
     // a 64bit constant and then explicit casting in SPIR-V requires Int64
     // capability. We should avoid introducing unnecessary capabilities to
     // our best.
-    llvm::APSInt intValue;
-    if (expr->EvaluateAsInt(intValue, astContext, Expr::SE_NoSideEffects)) {
-      const auto valueId = translateAPInt(intValue, toType);
+    if (const uint32_t valueId = tryToEvaluateAsConst(expr))
       return SpirvEvalInfo(valueId).setConstant().setRValue();
-    }
 
     const auto valueId =
         castToInt(doExpr(subExpr), subExprType, toType, subExpr->getExprLoc());
@@ -1624,12 +1629,8 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
   case CastKind::CK_HLSLCC_IntegralToFloating: {
     // First try to see if we can do constant folding for floating point
     // numbers like what we are doing for integers in the above.
-    Expr::EvalResult evalResult;
-    if (expr->EvaluateAsRValue(evalResult, astContext) &&
-        !evalResult.HasSideEffects) {
-      const auto valueId = translateAPFloat(evalResult.Val.getFloat(), toType);
+    if (const uint32_t valueId = tryToEvaluateAsConst(expr))
       return SpirvEvalInfo(valueId).setConstant().setRValue();
-    }
 
     const auto valueId = castToFloat(doExpr(subExpr), subExprType, toType,
                                      subExpr->getExprLoc());
@@ -1640,12 +1641,8 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
   case CastKind::CK_HLSLCC_IntegralToBoolean:
   case CastKind::CK_HLSLCC_FloatingToBoolean: {
     // First try to see if we can do constant folding.
-    bool boolVal;
-    if (!expr->HasSideEffects(astContext) &&
-        expr->EvaluateAsBooleanCondition(boolVal, astContext)) {
-      const auto valueId = theBuilder.getConstantBool(boolVal);
+    if (const uint32_t valueId = tryToEvaluateAsConst(expr))
       return SpirvEvalInfo(valueId).setConstant().setRValue();
-    }
 
     const auto valueId = castToBool(doExpr(subExpr), subExprType, toType);
     return SpirvEvalInfo(valueId).setRValue();
@@ -2345,16 +2342,14 @@ uint32_t SPIRVEmitter::processTextureGatherCmp(const CXXMemberCallExpr *expr) {
   const auto status = hasStatusArg ? doExpr(expr->getArg(numArgs - 1)) : 0;
 
   return theBuilder.createImageGather(
-      retType, imageType, image, sampler, coordinate,
-      /*component*/ 0, comparator, constOffset, varOffset, /*constOffsets*/ 0,
+      retType, imageType, image, sampler, coordinate, /*component*/ 0,
+      comparator, constOffset, varOffset, /*constOffsets*/ 0,
       /*sampleNumber*/ 0, status);
 }
 
-SpirvEvalInfo SPIRVEmitter::processBufferTextureLoad(const Expr *object,
-                                                     const uint32_t locationId,
-                                                     uint32_t constOffset,
-                                                     uint32_t varOffset,
-                                                     uint32_t lod) {
+SpirvEvalInfo SPIRVEmitter::processBufferTextureLoad(
+    const Expr *object, const uint32_t locationId, uint32_t constOffset,
+    uint32_t varOffset, uint32_t lod, uint32_t residencyCode) {
   // Loading for Buffer and RWBuffer translates to an OpImageFetch.
   // The result type of an OpImageFetch must be a vec4 of float or int.
   const auto type = object->getType();
@@ -2387,37 +2382,16 @@ SpirvEvalInfo SPIRVEmitter::processBufferTextureLoad(const Expr *object,
     emitError("buffer/texture type unimplemented", object->getExprLoc());
     return 0;
   }
-  const uint32_t resultTypeId =
-      elemCount == 1 ? elemTypeId
-                     : theBuilder.getVecType(elemTypeId, elemCount);
 
   // OpImageFetch and OpImageRead can only fetch a vector of 4 elements.
   const uint32_t texelTypeId = theBuilder.getVecType(elemTypeId, 4u);
-  const uint32_t texel =
-      theBuilder.createImageFetchOrRead(doFetch, texelTypeId, type, objectId,
-                                        locationId, lod, constOffset, varOffset,
-                                        /*constOffsets*/ 0, sampleNumber);
+  const uint32_t texel = theBuilder.createImageFetchOrRead(
+      doFetch, texelTypeId, type, objectId, locationId, lod, constOffset,
+      varOffset, /*constOffsets*/ 0, sampleNumber, residencyCode);
 
-  uint32_t retVal = texel;
   // If the result type is a vec1, vec2, or vec3, some extra processing
   // (extraction) is required.
-  switch (elemCount) {
-  case 1:
-    retVal = theBuilder.createCompositeExtract(elemTypeId, texel, {0});
-    break;
-  case 2:
-    retVal = theBuilder.createVectorShuffle(resultTypeId, texel, texel, {0, 1});
-    break;
-  case 3:
-    retVal =
-        theBuilder.createVectorShuffle(resultTypeId, texel, texel, {0, 1, 2});
-    break;
-  case 4:
-    break;
-  default:
-    llvm_unreachable("vector element count must be 1, 2, 3, or 4");
-  }
-
+  uint32_t retVal = extractVecFromVec4(texel, elemCount, elemTypeId);
   return SpirvEvalInfo(retVal).setRValue();
 }
 
@@ -2436,7 +2410,7 @@ SpirvEvalInfo SPIRVEmitter::processByteAddressBufferLoadStore(
            typeTranslator.isByteAddressBuffer(type));
     if (expr->getNumArgs() == 2) {
       emitError(
-          "(RW)ByteAddressBuffer::Load(in address, out status) unimplemented",
+          "(RW)ByteAddressBuffer::Load(in address, out status) not supported",
           expr->getExprLoc());
       return 0;
     }
@@ -2512,8 +2486,9 @@ SpirvEvalInfo SPIRVEmitter::processByteAddressBufferLoadStore(
 SpirvEvalInfo
 SPIRVEmitter::processStructuredBufferLoad(const CXXMemberCallExpr *expr) {
   if (expr->getNumArgs() == 2) {
-    emitError("(RW)StructuredBuffer::Load(int, int) unimplemented",
-              expr->getExprLoc());
+    emitError(
+        "(RW)StructuredBuffer::Load(in location, out status) not supported",
+        expr->getExprLoc());
     return 0;
   }
 
@@ -2526,8 +2501,7 @@ SPIRVEmitter::processStructuredBufferLoad(const CXXMemberCallExpr *expr) {
   const uint32_t zero = theBuilder.getConstantInt32(0);
   const uint32_t index = doExpr(expr->getArg(0));
 
-  return turnIntoElementPtr(info, structType, {zero, index}, theBuilder,
-                            typeTranslator);
+  return turnIntoElementPtr(info, structType, {zero, index});
 }
 
 uint32_t SPIRVEmitter::incDecRWACSBufferCounter(const CXXMemberCallExpr *expr,
@@ -2576,8 +2550,7 @@ SPIRVEmitter::processACSBufferAppendConsume(const CXXMemberCallExpr *expr) {
 
   const auto bufferElemTy = hlsl::GetHLSLResourceResultType(object->getType());
 
-  (void)turnIntoElementPtr(bufferInfo, bufferElemTy, {zero, index}, theBuilder,
-                           typeTranslator);
+  (void)turnIntoElementPtr(bufferInfo, bufferElemTy, {zero, index});
 
   if (isAppend) {
     // Write out the value
@@ -2643,19 +2616,6 @@ void SPIRVEmitter::handleOffsetInMethodCall(const CXXMemberCallExpr *expr,
   else
     *varOffset = doExpr(expr->getArg(index));
 };
-
-void SPIRVEmitter::handleOptionalOffsetInMethodCall(
-    const CXXMemberCallExpr *expr, uint32_t index, uint32_t *constOffset,
-    uint32_t *varOffset) {
-  *constOffset = *varOffset = 0; // Initialize both first
-
-  if (expr->getNumArgs() == index + 1) { // Has offset argument
-    if (*constOffset = tryToEvaluateAsConst(expr->getArg(index)))
-      return; // Constant offset
-    else
-      *varOffset = doExpr(expr->getArg(index));
-  }
-}
 
 SpirvEvalInfo
 SPIRVEmitter::processIntrinsicMemberCall(const CXXMemberCallExpr *expr,
@@ -2778,6 +2738,52 @@ SPIRVEmitter::processIntrinsicMemberCall(const CXXMemberCallExpr *expr,
   return SpirvEvalInfo(retVal).setRValue();
 }
 
+uint32_t SPIRVEmitter::createImageSample(
+    QualType retType, uint32_t imageType, uint32_t image, uint32_t sampler,
+    uint32_t coordinate, uint32_t compareVal, uint32_t bias, uint32_t lod,
+    std::pair<uint32_t, uint32_t> grad, uint32_t constOffset,
+    uint32_t varOffset, uint32_t constOffsets, uint32_t sample, uint32_t minLod,
+    uint32_t residencyCodeId) {
+
+  const auto retTypeId = typeTranslator.translateType(retType);
+
+  // SampleDref* instructions in SPIR-V always return a scalar.
+  // They also have the correct type in HLSL.
+  if (compareVal) {
+    return theBuilder.createImageSample(retTypeId, imageType, image, sampler,
+                                        coordinate, compareVal, bias, lod, grad,
+                                        constOffset, varOffset, constOffsets,
+                                        sample, minLod, residencyCodeId);
+  }
+
+  // Non-Dref Sample instructions in SPIR-V must always return a vec4.
+  auto texelTypeId = retTypeId;
+  QualType elemType = {};
+  uint32_t elemTypeId = 0;
+  uint32_t retVecSize = 0;
+  if (TypeTranslator::isVectorType(retType, &elemType, &retVecSize) &&
+      retVecSize != 4) {
+    elemTypeId = typeTranslator.translateType(elemType);
+    texelTypeId = theBuilder.getVecType(elemTypeId, 4);
+  } else if (TypeTranslator::isScalarType(retType)) {
+    retVecSize = 1;
+    elemTypeId = typeTranslator.translateType(retType);
+    texelTypeId = theBuilder.getVecType(elemTypeId, 4);
+  }
+
+  uint32_t retVal = theBuilder.createImageSample(
+      texelTypeId, imageType, image, sampler, coordinate, compareVal, bias, lod,
+      grad, constOffset, varOffset, constOffsets, sample, minLod,
+      residencyCodeId);
+
+  // Extract smaller vector from the vec4 result if necessary.
+  if (texelTypeId != retTypeId) {
+    retVal = extractVecFromVec4(retVal, retVecSize, elemTypeId);
+  }
+
+  return retVal;
+}
+
 uint32_t SPIRVEmitter::processTextureSampleGather(const CXXMemberCallExpr *expr,
                                                   const bool isSample) {
   // Signatures:
@@ -2814,7 +2820,7 @@ uint32_t SPIRVEmitter::processTextureSampleGather(const CXXMemberCallExpr *expr,
   uint32_t clamp = 0;
   if (numArgs > 2 && expr->getArg(2)->getType()->isFloatingType())
     clamp = doExpr(expr->getArg(2));
-  else if(numArgs > 3 && expr->getArg(3)->getType()->isFloatingType())
+  else if (numArgs > 3 && expr->getArg(3)->getType()->isFloatingType())
     clamp = doExpr(expr->getArg(3));
   const bool hasClampArg = (clamp != 0);
   const auto status = hasStatusArg ? doExpr(expr->getArg(numArgs - 1)) : 0;
@@ -2833,18 +2839,16 @@ uint32_t SPIRVEmitter::processTextureSampleGather(const CXXMemberCallExpr *expr,
   if (hasOffsetArg)
     handleOffsetInMethodCall(expr, 2, &constOffset, &varOffset);
 
-  const auto retType =
-      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
-
+  const auto retType = expr->getDirectCallee()->getReturnType();
+  const auto retTypeId = typeTranslator.translateType(retType);
   if (isSample) {
-    // TODO: Handle sparse cases for this method.
-    return theBuilder.createImageSample(
+    return createImageSample(
         retType, imageType, image, sampler, coordinate, /*compareVal*/ 0,
         /*bias*/ 0, /*lod*/ 0, std::make_pair(0, 0), constOffset, varOffset,
         /*constOffsets*/ 0, /*sampleNumber*/ 0, /*minLod*/ clamp, status);
   } else {
     return theBuilder.createImageGather(
-        retType, imageType, image, sampler, coordinate,
+        retTypeId, imageType, image, sampler, coordinate,
         // .Gather() doc says we return four components of red data.
         theBuilder.getConstantInt32(0), /*compareVal*/ 0, constOffset,
         varOffset, /*constOffsets*/ 0, /*sampleNumber*/ 0, status);
@@ -2916,16 +2920,15 @@ SPIRVEmitter::processTextureSampleBiasLevel(const CXXMemberCallExpr *expr,
   }
   // If offset is present in .Bias()/.SampleLevel(), it is the fourth argument.
   uint32_t constOffset = 0, varOffset = 0;
-  if(hasOffsetArg)
+  if (hasOffsetArg)
     handleOffsetInMethodCall(expr, 3, &constOffset, &varOffset);
 
-  const auto retType =
-      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
+  const auto retType = expr->getDirectCallee()->getReturnType();
 
-  return theBuilder.createImageSample(
-      retType, imageType, image, sampler, coordinate, /*compareVal*/ 0, bias,
-      lod, std::make_pair(0, 0), constOffset, varOffset, /*constOffsets*/ 0,
-      /*sampleNumber*/ 0, /*minLod*/ clamp, status);
+  return createImageSample(retType, imageType, image, sampler, coordinate,
+                           /*compareVal*/ 0, bias, lod, std::make_pair(0, 0),
+                           constOffset, varOffset, /*constOffsets*/ 0,
+                           /*sampleNumber*/ 0, /*minLod*/ clamp, status);
 }
 
 uint32_t SPIRVEmitter::processTextureSampleGrad(const CXXMemberCallExpr *expr) {
@@ -2975,10 +2978,8 @@ uint32_t SPIRVEmitter::processTextureSampleGrad(const CXXMemberCallExpr *expr) {
   if (hasOffsetArg)
     handleOffsetInMethodCall(expr, 4, &constOffset, &varOffset);
 
-  const auto retType =
-      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
-
-  return theBuilder.createImageSample(
+  const auto retType = expr->getDirectCallee()->getReturnType();
+  return createImageSample(
       retType, imageType, image, sampler, coordinate, /*compareVal*/ 0,
       /*bias*/ 0, /*lod*/ 0, std::make_pair(ddx, ddy), constOffset, varOffset,
       /*constOffsets*/ 0, /*sampleNumber*/ 0, /*minLod*/ clamp, status);
@@ -3057,29 +3058,54 @@ SPIRVEmitter::processTextureSampleCmpCmpLevelZero(const CXXMemberCallExpr *expr,
   const uint32_t compareVal = doExpr(expr->getArg(2));
   // If offset is present in .SampleCmp(), it will be the fourth argument.
   uint32_t constOffset = 0, varOffset = 0;
-  if(hasOffsetArg)
+  if (hasOffsetArg)
     handleOffsetInMethodCall(expr, 3, &constOffset, &varOffset);
   const uint32_t lod = isCmp ? 0 : theBuilder.getConstantFloat32(0);
 
-  const auto retType =
-      typeTranslator.translateType(expr->getDirectCallee()->getReturnType());
+  const auto retType = expr->getDirectCallee()->getReturnType();
   const auto imageType = typeTranslator.translateType(imageExpr->getType());
 
-  return theBuilder.createImageSample(
-      retType, imageType, image, sampler, coordinate, compareVal, /*bias*/ 0,
-      lod, std::make_pair(0, 0), constOffset, varOffset, /*constOffsets*/ 0,
-      /*sampleNumber*/ 0, /*minLod*/ clamp, status);
+  return createImageSample(retType, imageType, image, sampler, coordinate,
+                           compareVal, /*bias*/ 0, lod, std::make_pair(0, 0),
+                           constOffset, varOffset, /*constOffsets*/ 0,
+                           /*sampleNumber*/ 0, /*minLod*/ clamp, status);
 }
 
 SpirvEvalInfo
 SPIRVEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
   // Signature:
+  // For Texture1D, Texture1DArray, Texture2D, Texture2DArray, Texture3D:
+  // ret Object.Load(int Location
+  //                 [, int Offset]
+  //                 [, uint status]);
+  //
+  // For Texture2DMS and Texture2DMSArray, there is one additional argument:
   // ret Object.Load(int Location
   //                 [, int SampleIndex]
-  //                 [, int Offset]);
+  //                 [, int Offset]
+  //                 [, uint status]);
+  //
+  // For (RW)Buffer, RWTexture1D, RWTexture1DArray, RWTexture2D,
+  // RWTexture2DArray, RWTexture3D:
+  // ret Object.Load (int Location
+  //                  [, uint status]);
+  //
+  // Note: (RW)ByteAddressBuffer and (RW)StructuredBuffer types also have Load
+  // methods that take an additional Status argument. However, since these types
+  // are not represented as OpTypeImage in SPIR-V, we don't have a way of
+  // figuring out the Residency Code for them. Therefore having the Status
+  // argument for these types is not supported.
+  //
+  // For (RW)ByteAddressBuffer:
+  // ret Object.{Load,Load2,Load3,Load4} (int Location
+  //                                      [, uint status]);
+  //
+  // For (RW)StructuredBuffer:
+  // ret Object.Load (int Location
+  //                  [, uint status]);
+  //
 
   const auto *object = expr->getImplicitObjectArgument();
-  const auto *location = expr->getArg(0);
   const auto objectType = object->getType();
 
   if (typeTranslator.isRWByteAddressBuffer(objectType) ||
@@ -3089,10 +3115,23 @@ SPIRVEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
   if (TypeTranslator::isStructuredBuffer(objectType))
     return processStructuredBufferLoad(expr);
 
+  const auto numArgs = expr->getNumArgs();
+  const auto *location = expr->getArg(0);
+  const bool isTextureMS = TypeTranslator::isTextureMS(objectType);
+  const bool hasStatusArg =
+      expr->getArg(numArgs - 1)->getType()->isUnsignedIntegerType();
+  const auto status = hasStatusArg ? doExpr(expr->getArg(numArgs - 1)) : 0;
+
   if (TypeTranslator::isBuffer(objectType) ||
       TypeTranslator::isRWBuffer(objectType) ||
       TypeTranslator::isRWTexture(objectType))
-    return processBufferTextureLoad(object, doExpr(location));
+    return processBufferTextureLoad(object, doExpr(location), /*constOffset*/ 0,
+                                    /*varOffset*/ 0, /*lod*/ 0,
+                                    /*residencyCode*/ status);
+
+  // Subtract 1 for status (if it exists), and 1 for sampleIndex (if it exists),
+  // and 1 for location.
+  const bool hasOffsetArg = numArgs - hasStatusArg - isTextureMS - 1 > 0;
 
   if (TypeTranslator::isTexture(objectType)) {
     // .Load() has a second optional paramter for offset.
@@ -3100,12 +3139,13 @@ SPIRVEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
     uint32_t constOffset = 0, varOffset = 0;
     uint32_t coordinate = locationId, lod = 0;
 
-    if (TypeTranslator::isTextureMS(objectType)) {
+    if (isTextureMS) {
       // SampleIndex is only available when the Object is of Texture2DMS or
       // Texture2DMSArray types. Under those cases, Offset will be the third
       // parameter (index 2).
       lod = doExpr(expr->getArg(1));
-      handleOptionalOffsetInMethodCall(expr, 2, &constOffset, &varOffset);
+      if (hasOffsetArg)
+        handleOffsetInMethodCall(expr, 2, &constOffset, &varOffset);
     } else {
       // For Texture Load() functions, the location parameter is a vector
       // that consists of both the coordinate and the mipmap level (via the
@@ -3114,11 +3154,12 @@ SPIRVEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
       splitVecLastElement(location->getType(), locationId, &coordinate, &lod);
       // For textures other than Texture2DMS(Array), offset should be the
       // second parameter (index 1).
-      handleOptionalOffsetInMethodCall(expr, 1, &constOffset, &varOffset);
+      if (hasOffsetArg)
+        handleOffsetInMethodCall(expr, 1, &constOffset, &varOffset);
     }
 
     return processBufferTextureLoad(object, coordinate, constOffset, varOffset,
-                                    lod);
+                                    lod, status);
   }
   emitError("Load() of the given object type unimplemented",
             object->getExprLoc());
@@ -3158,13 +3199,15 @@ SPIRVEmitter::doCXXOperatorCallExpr(const CXXOperatorCallExpr *expr) {
                                ? theBuilder.getConstantUint32(0)
                                : 0;
       return processBufferTextureLoad(baseExpr, doExpr(indexExpr),
-                                      /*constOffset*/ 0, /*varOffset*/ 0, lod);
+                                      /*constOffset*/ 0, /*varOffset*/ 0, lod,
+                                      /*residencyCode*/ 0);
     }
     // .mips[][] or .sample[][] must use the correct slice.
     if (isTextureMipsSampleIndexing(expr, &baseExpr, &indexExpr, &lodExpr)) {
       const uint32_t lod = doExpr(lodExpr);
       return processBufferTextureLoad(baseExpr, doExpr(indexExpr),
-                                      /*constOffset*/ 0, /*varOffset*/ 0, lod);
+                                      /*constOffset*/ 0, /*varOffset*/ 0, lod,
+                                      /*residencyCode*/ 0);
     }
   }
 
@@ -3180,14 +3223,10 @@ SPIRVEmitter::doCXXOperatorCallExpr(const CXXOperatorCallExpr *expr) {
   // TODO: We can optimize the codegen by emitting OpCompositeExtract if
   // all indices are contant integers.
   if (!baseExpr->isGLValue()) {
-    const uint32_t baseType = typeTranslator.translateType(baseExpr->getType());
-    const uint32_t tempVar = theBuilder.addFnVar(baseType, "temp.var");
-    theBuilder.createStore(tempVar, base);
-    base = tempVar;
+    base = createTemporaryVar(baseExpr->getType(), "vector", base);
   }
 
-  return turnIntoElementPtr(base, expr->getType(), indices, theBuilder,
-                            typeTranslator);
+  return turnIntoElementPtr(base, expr->getType(), indices);
 }
 
 SpirvEvalInfo
@@ -3340,14 +3379,35 @@ SpirvEvalInfo SPIRVEmitter::doInitListExpr(const InitListExpr *expr) {
 
 SpirvEvalInfo SPIRVEmitter::doMemberExpr(const MemberExpr *expr) {
   llvm::SmallVector<uint32_t, 4> indices;
-  auto info = doExpr(collectArrayStructIndices(expr, &indices));
+  const Expr *base = collectArrayStructIndices(expr, &indices);
+  auto info = doExpr(base);
 
   if (!indices.empty()) {
-    (void)turnIntoElementPtr(info, expr->getType(), indices, theBuilder,
-                             typeTranslator);
+    // Sometime we are accessing the member of a rvalue, e.g.,
+    // <some-function-returing-a-struct>().<some-field>
+    // Create a temporary variable to hold the rvalue so that we can use access
+    // chain to index into it.
+    if (info.isRValue()) {
+      SpirvEvalInfo tempVar = createTemporaryVar(
+          base->getType(), TypeTranslator::getName(base->getType()), info);
+      (void)turnIntoElementPtr(tempVar, expr->getType(), indices);
+      info.setResultId(theBuilder.createLoad(
+          typeTranslator.translateType(expr->getType()), tempVar));
+    } else {
+      (void)turnIntoElementPtr(info, expr->getType(), indices);
+    }
   }
 
   return info;
+}
+
+uint32_t SPIRVEmitter::createTemporaryVar(QualType type, llvm::StringRef name,
+                                          uint32_t init) {
+  const uint32_t varType = typeTranslator.translateType(type);
+  const std::string varName = "temp.var." + name.str();
+  const uint32_t varId = theBuilder.addFnVar(varType, varName);
+  theBuilder.createStore(varId, init);
+  return varId;
 }
 
 SpirvEvalInfo SPIRVEmitter::doUnaryOperator(const UnaryOperator *expr) {
@@ -3756,15 +3816,17 @@ void SPIRVEmitter::initOnce(QualType varType, std::string varName,
 
   const uint32_t condition = theBuilder.createLoad(boolType, initDoneVar);
 
-  const uint32_t thenBB = theBuilder.createBasicBlock("if.true");
-  const uint32_t mergeBB = theBuilder.createBasicBlock("if.merge");
+  const uint32_t todoBB = theBuilder.createBasicBlock("if.init.todo");
+  const uint32_t doneBB = theBuilder.createBasicBlock("if.init.done");
 
-  theBuilder.createConditionalBranch(condition, thenBB, mergeBB, mergeBB);
-  theBuilder.addSuccessor(thenBB);
-  theBuilder.addSuccessor(mergeBB);
-  theBuilder.setMergeTarget(mergeBB);
+  // If initDoneVar contains true, we jump to the "done" basic block; otherwise,
+  // jump to the "todo" basic block.
+  theBuilder.createConditionalBranch(condition, doneBB, todoBB, doneBB);
+  theBuilder.addSuccessor(todoBB);
+  theBuilder.addSuccessor(doneBB);
+  theBuilder.setMergeTarget(doneBB);
 
-  theBuilder.setInsertPoint(thenBB);
+  theBuilder.setInsertPoint(todoBB);
   // Do initialization and mark done
   if (varInit) {
     theBuilder.createStore(varPtr, doExpr(varInit));
@@ -3773,10 +3835,10 @@ void SPIRVEmitter::initOnce(QualType varType, std::string varName,
     theBuilder.createStore(varPtr, theBuilder.getConstantNull(typeId));
   }
   theBuilder.createStore(initDoneVar, theBuilder.getConstantBool(true));
-  theBuilder.createBranch(mergeBB);
-  theBuilder.addSuccessor(mergeBB);
+  theBuilder.createBranch(doneBB);
+  theBuilder.addSuccessor(doneBB);
 
-  theBuilder.setInsertPoint(mergeBB);
+  theBuilder.setInsertPoint(doneBB);
 }
 
 bool SPIRVEmitter::isVectorShuffle(const Expr *expr) {
@@ -4403,6 +4465,16 @@ const Expr *SPIRVEmitter::collectArrayStructIndices(
   return expr;
 }
 
+SpirvEvalInfo &SPIRVEmitter::turnIntoElementPtr(
+    SpirvEvalInfo &info, QualType elemType,
+    const llvm::SmallVector<uint32_t, 4> &indices) {
+  assert(!info.isRValue());
+  const uint32_t ptrType = theBuilder.getPointerType(
+      typeTranslator.translateType(elemType, info.getLayoutRule()),
+      info.getStorageClass());
+  return info.setResultId(theBuilder.createAccessChain(ptrType, info, indices));
+}
+
 uint32_t SPIRVEmitter::castToBool(const uint32_t fromVal, QualType fromType,
                                   QualType toBoolType) {
   if (isSameScalarOrVecType(fromType, toBoolType))
@@ -4421,7 +4493,7 @@ uint32_t SPIRVEmitter::castToInt(const uint32_t fromVal, QualType fromType,
   if (isSameScalarOrVecType(fromType, toIntType))
     return fromVal;
 
-  const uint32_t intType = typeTranslator.translateType(toIntType);
+  uint32_t intType = typeTranslator.translateType(toIntType);
 
   // AST may include a 'literal int' to 'int' conversion. No-op.
   if (fromType->isLiteralType(astContext) && fromType->isIntegerType() &&
@@ -4431,6 +4503,15 @@ uint32_t SPIRVEmitter::castToInt(const uint32_t fromVal, QualType fromType,
   if (isBoolOrVecOfBoolType(fromType)) {
     const uint32_t one = getValueOne(toIntType);
     const uint32_t zero = getValueZero(toIntType);
+    if (toIntType->isScalarType() && toIntType->isLiteralType(astContext)) {
+      // Special case for handling casting from boolean values to literal ints.
+      // For source code like (a == b) != 5, an IntegralCast will be inserted
+      // for (a == b), whose return type will be 64-bit integer if following the
+      // normal path.
+      // TODO: This is not beautiful. But other ways are even worse.
+      intType = toIntType->isSignedIntegerType() ? theBuilder.getInt32Type()
+                                                 : theBuilder.getUint32Type();
+    }
     return theBuilder.createSelect(intType, fromVal, one, zero);
   }
 
@@ -4625,6 +4706,10 @@ SpirvEvalInfo SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
                                            /*groupSync*/ true,
                                            /*isAllBarrier*/ true);
     break;
+  case hlsl::IntrinsicOp::IOP_CheckAccessFullyMapped:
+    retVal =
+        theBuilder.createImageSparseTexelsResident(doExpr(callExpr->getArg(0)));
+    break;
   case hlsl::IntrinsicOp::IOP_mul:
     retVal = processIntrinsicMul(callExpr);
     break;
@@ -4695,7 +4780,6 @@ SpirvEvalInfo SPIRVEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     retVal = processIntrinsicF32ToF16(callExpr);
     break;
   case hlsl::IntrinsicOp::IOP_abort:
-  case hlsl::IntrinsicOp::IOP_CheckAccessFullyMapped:
   case hlsl::IntrinsicOp::IOP_GetRenderTargetSampleCount:
   case hlsl::IntrinsicOp::IOP_GetRenderTargetSamplePosition: {
     emitError("no equivalent for %0 intrinsic function in Vulkan",
@@ -5408,24 +5492,66 @@ uint32_t SPIRVEmitter::processIntrinsicMemoryBarrier(const CallExpr *callExpr,
                                                      bool isDevice,
                                                      bool groupSync,
                                                      bool isAllBarrier) {
-  // Execution Barrier scope:
-  // Device    = 1
-  // Workgroup = 2
-  // Memory Barrier scope:
-  // Device    = 1
-  // Workgroup = 2
-  // Memory Semantics Barrier scope:
-  // WorkgroupMemory      = 0x100 = 256
-  // CrossWorkgroupMemory = 0x200 = 512
-  // 'All Memory Barrier' must place barrier at several different levels, so
-  // several flags must be turned on:
-  // 0x10 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 = 0xFD0 = 4048.
-  const uint32_t memSemaMask = isAllBarrier ? 0xFD0 : isDevice ? 0x200 : 0x100;
-  const auto memSema = theBuilder.getConstantUint32(memSemaMask);
-  const auto memScope = isDevice ? theBuilder.getConstantUint32(1)
-                                 : theBuilder.getConstantUint32(2);
-  const auto execScope = groupSync ? memScope : 0;
-  theBuilder.createBarrier(execScope, memScope, memSema);
+  // * DeviceMemoryBarrier =
+  // OpMemoryBarrier (memScope=Device,
+  //                  sem=Image|Uniform|AcquireRelease)
+  //
+  // * DeviceMemoryBarrierWithGroupSync =
+  // OpControlBarrier(execScope = Workgroup,
+  //                  memScope=Device,
+  //                  sem=Image|Uniform|AcquireRelease)
+  const spv::MemorySemanticsMask deviceMemoryBarrierSema =
+      spv::MemorySemanticsMask::ImageMemory |
+      spv::MemorySemanticsMask::UniformMemory |
+      spv::MemorySemanticsMask::AcquireRelease;
+
+  // * GroupMemoryBarrier =
+  // OpMemoryBarrier (memScope=Workgroup,
+  //                  sem = Workgroup|AcquireRelease)
+  //
+  // * GroupMemoryBarrierWithGroupSync =
+  // OpControlBarrier (execScope = Workgroup,
+  //                   memScope = Workgroup,
+  //                   sem = Workgroup|AcquireRelease)
+  const spv::MemorySemanticsMask groupMemoryBarrierSema =
+      spv::MemorySemanticsMask::WorkgroupMemory |
+      spv::MemorySemanticsMask::AcquireRelease;
+
+  // * AllMemoryBarrier =
+  // OpMemoryBarrier(memScope = Device,
+  //                 sem = Image|Uniform|Workgroup|AcquireRelease)
+  //
+  // * AllMemoryBarrierWithGroupSync =
+  // OpControlBarrier(execScope = Workgroup,
+  //                  memScope = Device,
+  //                  sem = Image|Uniform|Workgroup|AcquireRelease)
+  const spv::MemorySemanticsMask allMemoryBarrierSema =
+      spv::MemorySemanticsMask::ImageMemory |
+      spv::MemorySemanticsMask::UniformMemory |
+      spv::MemorySemanticsMask::WorkgroupMemory |
+      spv::MemorySemanticsMask::AtomicCounterMemory |
+      spv::MemorySemanticsMask::AcquireRelease;
+
+  // Get <result-id> for execution scope.
+  // If present, execution scope is always Workgroup!
+  const uint32_t execScopeId =
+      groupSync ? theBuilder.getConstantUint32(
+                      static_cast<uint32_t>(spv::Scope::Workgroup))
+                : 0;
+
+  // Get <result-id> for memory scope
+  const spv::Scope memScope =
+      (isDevice || isAllBarrier) ? spv::Scope::Device : spv::Scope::Workgroup;
+  const uint32_t memScopeId =
+      theBuilder.getConstantUint32(static_cast<uint32_t>(memScope));
+
+  // Get <result-id> for memory semantics
+  const auto memSemaMask = isAllBarrier ? allMemoryBarrierSema
+                                        : isDevice ? deviceMemoryBarrierSema
+                                                   : groupMemoryBarrierSema;
+  const uint32_t memSema =
+      theBuilder.getConstantUint32(static_cast<uint32_t>(memSemaMask));
+  theBuilder.createBarrier(execScopeId, memScopeId, memSema);
   return 0;
 }
 
@@ -6578,7 +6704,7 @@ bool SPIRVEmitter::processTessellationShaderAttributes(
             .Default(ExecutionMode::Max);
     if (hsExecMode == ExecutionMode::Max) {
       emitError("unknown domain type specified for entry function",
-                decl->getLocation());
+                domain->getLocation());
       return false;
     }
     theBuilder.addExecutionMode(entryFunctionId, hsExecMode, {});
@@ -6590,9 +6716,13 @@ bool SPIRVEmitter::processTessellationShaderAttributes(
     return true;
 
   if (auto *partitioning = decl->getAttr<HLSLPartitioningAttr>()) {
-    // TODO: Could not find an equivalent of "pow2" partitioning scheme in
-    // SPIR-V.
     const auto scheme = partitioning->getScheme().lower();
+    if (scheme == "pow2") {
+      emitError("pow2 partitioning scheme is not supported since there is no "
+                "equivalent in Vulkan",
+                partitioning->getLocation());
+      return false;
+    }
     const ExecutionMode hsExecMode =
         llvm::StringSwitch<ExecutionMode>(scheme)
             .Case("fractional_even", ExecutionMode::SpacingFractionalEven)
@@ -6601,7 +6731,7 @@ bool SPIRVEmitter::processTessellationShaderAttributes(
             .Default(ExecutionMode::Max);
     if (hsExecMode == ExecutionMode::Max) {
       emitError("unknown partitioning scheme in hull shader",
-                decl->getLocation());
+                partitioning->getLocation());
       return false;
     }
     theBuilder.addExecutionMode(entryFunctionId, hsExecMode, {});
@@ -6621,7 +6751,7 @@ bool SPIRVEmitter::processTessellationShaderAttributes(
         theBuilder.addExecutionMode(entryFunctionId, hsExecMode, {});
       } else {
         emitError("unknown output topology in hull shader",
-                  decl->getLocation());
+                  outputTopology->getLocation());
         return false;
       }
     }
@@ -7218,6 +7348,31 @@ void SPIRVEmitter::processSwitchStmtUsingIfStmts(const SwitchStmt *switchStmt) {
   // default case.
   else if (defaultBody)
     doStmt(defaultBody);
+}
+
+uint32_t SPIRVEmitter::extractVecFromVec4(uint32_t fromId,
+                                          uint32_t targetVecSize,
+                                          uint32_t targetElemTypeId) {
+  assert(targetVecSize > 0 && targetVecSize < 5);
+  const uint32_t retType =
+      targetVecSize == 1
+          ? targetElemTypeId
+          : theBuilder.getVecType(targetElemTypeId, targetVecSize);
+  switch (targetVecSize) {
+  case 1:
+    return theBuilder.createCompositeExtract(retType, fromId, {0});
+    break;
+  case 2:
+    return theBuilder.createVectorShuffle(retType, fromId, fromId, {0, 1});
+    break;
+  case 3:
+    return theBuilder.createVectorShuffle(retType, fromId, fromId, {0, 1, 2});
+    break;
+  case 4:
+    return fromId;
+  default:
+    llvm_unreachable("vector element count must be 1, 2, 3, or 4");
+  }
 }
 
 } // end namespace spirv

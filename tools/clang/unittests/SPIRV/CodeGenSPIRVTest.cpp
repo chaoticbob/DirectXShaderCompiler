@@ -45,6 +45,9 @@ TEST_F(WholeFileTest, EmptyStructInterfaceVS) {
 TEST_F(FileTest, ScalarTypes) { runFileTest("type.scalar.hlsl"); }
 TEST_F(FileTest, VectorTypes) { runFileTest("type.vector.hlsl"); }
 TEST_F(FileTest, MatrixTypes) { runFileTest("type.matrix.hlsl"); }
+TEST_F(FileTest, MatrixTypesMajorness) {
+  runFileTest("type.matrix.majorness.hlsl", FileTest::Expect::Warning);
+}
 TEST_F(FileTest, StructTypes) { runFileTest("type.struct.hlsl"); }
 TEST_F(FileTest, ClassTypes) { runFileTest("type.class.hlsl"); }
 TEST_F(FileTest, ArrayTypes) { runFileTest("type.array.hlsl"); }
@@ -288,6 +291,9 @@ TEST_F(FileTest, CastImplicit2UInt) { runFileTest("cast.2uint.implicit.hlsl"); }
 TEST_F(FileTest, CastExplicit2UInt) { runFileTest("cast.2uint.explicit.hlsl"); }
 TEST_F(FileTest, CastImplicit2FP) { runFileTest("cast.2fp.implicit.hlsl"); }
 TEST_F(FileTest, CastExplicit2FP) { runFileTest("cast.2fp.explicit.hlsl"); }
+TEST_F(FileTest, CastImplicit2LiteralInt) {
+  runFileTest("cast.2literal-int.implicit.hlsl");
+}
 TEST_F(FileTest, CastImplicitFlatConversion) {
   runFileTest("cast.flat-conversion.implicit.hlsl");
 }
@@ -768,8 +774,11 @@ TEST_F(FileTest, IntrinsicsGroupMemoryBarrierWithGroupSync) {
 TEST_F(FileTest, IntrinsicsIsFinite) {
   runFileTest("intrinsics.isfinite.hlsl");
 }
-TEST_F(FileTest, IntrinsicsInterlockedMethods) {
-  runFileTest("intrinsics.interlocked-methods.hlsl");
+TEST_F(FileTest, IntrinsicsInterlockedMethodsPS) {
+  runFileTest("intrinsics.interlocked-methods.ps.hlsl");
+}
+TEST_F(FileTest, IntrinsicsInterlockedMethodsCS) {
+  runFileTest("intrinsics.interlocked-methods.cs.hlsl");
 }
 TEST_F(FileTest, IntrinsicsIsInf) { runFileTest("intrinsics.isinf.hlsl"); }
 TEST_F(FileTest, IntrinsicsIsNan) { runFileTest("intrinsics.isnan.hlsl"); }
@@ -831,7 +840,7 @@ TEST_F(FileTest, IntrinsicsAbort) {
   runFileTest("intrinsics.abort.hlsl", Expect::Failure);
 }
 TEST_F(FileTest, IntrinsicsCheckAccessFullyMapped) {
-  runFileTest("intrinsics.check-access-fully-mapped.hlsl", Expect::Failure);
+  runFileTest("intrinsics.check-access-fully-mapped.hlsl");
 }
 TEST_F(FileTest, IntrinsicsGetRenderTargetSampleCount) {
   runFileTest("intrinsics.get-render-target-sample-count.hlsl",
@@ -954,8 +963,8 @@ TEST_F(FileTest, SpirvInterpolationError) {
   runFileTest("spirv.interpolation.error.hlsl", FileTest::Expect::Failure);
 }
 
-TEST_F(FileTest, SpirvLegalizationStructuredBuffer) {
-  runFileTest("spirv.legal.sbuffer.hlsl", Expect::Success,
+TEST_F(FileTest, SpirvLegalizationOpaqueStruct) {
+  runFileTest("spirv.legal.opaque-struct.hlsl", Expect::Success,
               // The generated SPIR-V needs legalization.
               /*runValidation=*/false);
 }
@@ -1032,6 +1041,7 @@ TEST_F(FileTest, VulkanStructuredBufferCounter) {
 }
 
 TEST_F(FileTest, VulkanPushConstant) { runFileTest("vk.push-constant.hlsl"); }
+TEST_F(FileTest, VulkanPushConstantOffset) { runFileTest("vk.push-constant.offset.hlsl"); }
 TEST_F(FileTest, VulkanMultiplePushConstant) {
   runFileTest("vk.push-constant.multiple.hlsl", FileTest::Expect::Failure);
 }

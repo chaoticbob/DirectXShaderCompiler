@@ -504,6 +504,12 @@ the ``BufferBlock`` decoration.  The default layout rule used is GLSL
 ``std430``. A variable declared as one of these types will be placed in the
 ``Uniform`` storage class.
 
+For ``RWStructuredBuffer<T>``, each variable will have an associated counter
+variable generated. The counter variable will be of ``OpTypeStruct`` type, which
+only contains a 32-bit integer. The counter variable takes its own binding
+number. ``.IncrementCounter()``/``.DecrementCounter()`` will modify this counter
+variable.
+
 For example, for the following HLSL source code:
 
 .. code:: hlsl
@@ -536,11 +542,6 @@ will be translated into
 
   ; Variable
   %myCbuffer = OpVariable %_ptr_Uniform_type_ConstantBuffer_T Uniform
-
-If ``.IncrementCounter()`` or ``.DecrementCounter()`` is used in the source
-code, an additional associated counter variable will be created for manipulating
-the counter. The counter variable will be of ``OpTypeStruct`` type, which only
-contains a 32-bit integer. The counter variable takes its own binding number.
 
 ``AppendStructuredBuffer`` and ``ConsumeStructuredBuffer``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -655,43 +656,50 @@ HLSL Variables and Resources
 
 This section lists how various HLSL variables and resources are mapped.
 
-Variables are defined in HLSL using the following
-`syntax <https://msdn.microsoft.com/en-us/library/windows/desktop/bb509706(v=vs.85).aspx>`_
-rules::
-
-  [StorageClass] [TypeModifier] Type Name[Index]
-      [: Semantic]
-      [: Packoffset]
-      [: Register];
-      [Annotations]
-      [= InitialValue]
-
 Storage class
 -------------
 
 Normal local variables (without any modifier) will be placed in the ``Function``
-SPIR-V storage class.
+SPIR-V storage class. Normal global variables (without any modifer) will be
+placed in the ``Uniform`` or ``UniformConstant`` storage class.
 
-``static``
-~~~~~~~~~~
+- ``static``
 
-- Global variables with ``static`` modifier will be placed in the ``Private``
-  SPIR-V storage class. Initalizers of such global variables will be translated
-  into SPIR-V ``OpVariable`` initializers if possible; otherwise, they will be
-  initialized at the very beginning of the `entry function wrapper`_ using
-  SPIR-V ``OpStore``.
-- Local variables with ``static`` modifier will also be placed in the
-  ``Private`` SPIR-V storage class. initializers of such local variables will
-  also be translated into SPIR-V ``OpVariable`` initializers if possible;
-  otherwise, they will be initialized at the very beginning of the enclosing
-  function. To make sure that such a local variable is only initialized once,
-  a second boolean variable of the ``Private`` SPIR-V storage class will be
-  generated to mark its initialization status.
+  - Global variables with ``static`` modifier will be placed in the ``Private``
+    SPIR-V storage class. Initalizers of such global variables will be translated
+    into SPIR-V ``OpVariable`` initializers if possible; otherwise, they will be
+    initialized at the very beginning of the `entry function wrapper`_ using
+    SPIR-V ``OpStore``.
+  - Local variables with ``static`` modifier will also be placed in the
+    ``Private`` SPIR-V storage class. initializers of such local variables will
+    also be translated into SPIR-V ``OpVariable`` initializers if possible;
+    otherwise, they will be initialized at the very beginning of the enclosing
+    function. To make sure that such a local variable is only initialized once,
+    a second boolean variable of the ``Private`` SPIR-V storage class will be
+    generated to mark its initialization status.
 
-Type modifier
--------------
+- ``groupshared``
 
-[TODO]
+  - Global variables with ``groupshared`` modifier will be placed in the
+    ``Workgroup`` storage class.
+
+- ``uinform``
+
+  - This does not affect codegen. Variables will be treated like normal global
+    variables.
+
+- ``extern``
+
+  - This does not affect codegen. Variables will be treated like normal global
+    variables.
+
+- ``shared``
+
+  - This is a hint to the compiler. It will be ingored.
+
+- ``volatile``
+
+  - This is a hint to the compiler. It will be ingored.
 
 HLSL semantic and Vulkan ``Location``
 -------------------------------------
@@ -1516,6 +1524,7 @@ The following intrinsic HLSL functions have direct SPIR-V opcodes for them:
 ``isInf``                            ``OpIsInf``
 ``reversebits``                      ``OpBitReverse``
 ``transpose``                        ``OpTranspose``
+``CheckAccessFullyMapped``           ``OpImageSparseTexelsResident``
 ==================================== =================================
 
 Using GLSL extended instructions
@@ -1610,6 +1619,8 @@ Since Buffers are represented as ``OpTypeImage`` with ``Sampled`` set to 1
 operation. The return value of ``OpImageFetch`` is always a four-component
 vector; so proper additional instructions are generated to truncate the vector
 and return the desired number of elements.
+If an output unsigned integer ``status`` argument is present, ``OpImageSparseFetch``
+is used instead. The resulting SPIR-V ``Residency Code`` will be written to ``status``.
 
 ``operator[]``
 ++++++++++++++
@@ -1627,7 +1638,8 @@ Since Buffers are represented as ``OpTypeImage`` with dimension of ``Buffer``,
 +++++++++++
 Since RWBuffers are represented as ``OpTypeImage`` with ``Sampled`` set to 2
 (meaning to be used without a sampler), ``OpImageRead`` is used to perform this
-operation.
+operation. If an output unsigned integer ``status`` argument is present, ``OpImageSparseRead``
+is used instead. The resulting SPIR-V ``Residency Code`` will be written to ``status``.
 
 ``operator[]``
 ++++++++++++++
@@ -1779,8 +1791,8 @@ for that texture type.
 Common texture methods
 ~~~~~~~~~~~~~~~~~~~~~~
 
-``.Sample(sampler, location[, offset])``
-++++++++++++++++++++++++++++++++++++++++
+``.Sample(sampler, location[, offset][, clamp][, Status])``
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 Not available to ``Texture2DMS`` and ``Texture2DMSArray``.
 
@@ -1789,12 +1801,15 @@ since texture types are represented as ``OpTypeImage``. An ``OpSampledImage`` is
 created based on the ``sampler`` passed to the function. The resulting sampled
 image and the ``location`` passed to the function are used as arguments to
 ``OpImageSampleImplicitLod``, with the optional ``offset`` tranlated into
-addtional SPIR-V image operands ``ConstOffset`` or ``Offset`` on it.
+addtional SPIR-V image operands ``ConstOffset`` or ``Offset`` on it. The optional
+``clamp`` argument will be translated to the ``MinLod`` image operand.
 
-The overload with the status parameter are not supported.
+If an output unsigned integer ``status`` argument is present,
+``OpImageSparseSampleImplicitLod`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
-``.SampleLevel(sampler, location, lod[, offset])``
-++++++++++++++++++++++++++++++++++++++++++++++++++
+``.SampleLevel(sampler, location, lod[, offset][, Status])``
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 Not available to ``Texture2DMS`` and ``Texture2DMSArray``.
 
@@ -1806,21 +1821,26 @@ is attached to the instruction as an SPIR-V image operands ``Lod``. The optional
 ``offset`` is also tranlated into addtional SPIR-V image operands ``ConstOffset``
 or ``Offset`` on it.
 
-The overload with the status parameter are not supported.
+If an output unsigned integer ``status`` argument is present,
+``OpImageSparseSampleExplicitLod`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
-``.SampleGrad(sampler, location, ddx, ddy[, offset])``
-++++++++++++++++++++++++++++++++++++++++++++++++++++++
+``.SampleGrad(sampler, location, ddx, ddy[, offset][, clamp][, Status])``
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 Not available to ``Texture2DMS`` and ``Texture2DMSArray``.
 
 Similarly to ``.SampleLevel``, the ``ddx`` and ``ddy`` parameter are attached to
 the ``OpImageSampleExplicitLod`` instruction as an SPIR-V image operands
-``Grad``.
+``Grad``. The optional ``clamp`` argument will be translated into the ``MinLod``
+image operand.
 
-The overload with the status parameter are not supported.
+If an output unsigned integer ``status`` argument is present,
+``OpImageSparseSampleExplicitLod`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
-``.SampleBias(sampler, location, bias[, offset])``
-++++++++++++++++++++++++++++++++++++++++++++++++++
+``.SampleBias(sampler, location, bias[, offset][, clamp][, Status])``
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 Not available to ``Texture2DMS`` and ``Texture2DMSArray``.
 
@@ -1828,24 +1848,34 @@ The translation is similar to ``.Sample()``, with the ``bias`` parameter
 attached to the ``OpImageSampleImplicitLod`` instruction as an SPIR-V image
 operands ``Bias``.
 
-The overload with the status parameter are not supported.
+If an output unsigned integer ``status`` argument is present,
+``OpImageSparseSampleImplicitLod`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
-``.SampleCmp(sampler, location, comparator[, offset])``
-+++++++++++++++++++++++++++++++++++++++++++++++++++++++
+``.SampleCmp(sampler, location, comparator[, offset][, clamp][, Status])``
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 Not available to ``Texture3D``, ``Texture2DMS``, and ``Texture2DMSArray``.
 
 The translation is similar to ``.Sample()``, but the
 ``OpImageSampleDrefImplicitLod`` instruction are used.
 
-``.SampleCmpLevelZero(sampler, location, comparator[, offset])``
-++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+If an output unsigned integer ``status`` argument is present,
+``OpImageSparseSampleDrefImplicitLod`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
+
+``.SampleCmpLevelZero(sampler, location, comparator[, offset][, Status])``
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 Not available to ``Texture3D``, ``Texture2DMS``, and ``Texture2DMSArray``.
 
 The translation is similar to ``.Sample()``, but the
 ``OpImageSampleDrefExplicitLod`` instruction are used, with the additional
 ``Lod`` image operands set to 0.0.
+
+If an output unsigned integer ``status`` argument is present,
+``OpImageSparseSampleDrefExplicitLod`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
 ``.Gather()``
 +++++++++++++
@@ -1856,7 +1886,9 @@ Available to ``Texture2D``, ``Texture2DArray``, ``TextureCube``, and
 The translation is similar to ``.Sample()``, but the ``OpImageGather``
 instruction is used, with component setting to 0.
 
-The overload with the status parameter are not supported.
+If an output unsigned integer ``status`` argument is present,
+``OpImageSparseGather`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
 ``.GatherRed()``, ``.GatherGreen()``, ``.GatherBlue()``, ``.GatherAlpha()``
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -1872,7 +1904,9 @@ There are a few overloads for these functions:
 - For those overloads taking 4 offset parameters, those offset parameters will
   be conveyed as an additional ``ConstOffsets`` image operands to the
   instruction. So those offset parameters must all be constant values.
-- Those overloads with the status parameter are not supported.
+- For those overloads with the ``status`` parameter, ``OpImageSparseGather``
+  is used instead, and the resulting SPIR-V ``Residency Code`` will be
+  written to ``status``.
 
 ``.GatherCmp()``
 ++++++++++++++++
@@ -1883,7 +1917,10 @@ Available to ``Texture2D``, ``Texture2DArray``, ``TextureCube``, and
 The translation is similar to ``.Sample()``, but the ``OpImageDrefGather``
 instruction is used.
 
-The overload with the status parameter are not supported.
+For the overload with the output unsigned integer ``status`` argument,
+``OpImageSparseDrefGather`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
+
 
 ``.GatherCmpRed()``
 +++++++++++++++++++
@@ -1892,8 +1929,6 @@ Available to ``Texture2D``, ``Texture2DArray``, ``TextureCube``, and
 ``TextureCubeArray``.
 
 The translation is the same as ``.GatherCmp()``.
-
-The overload with the status parameter are not supported.
 
 ``.Load(location[, sampleIndex][, offset])``
 ++++++++++++++++++++++++++++++++++++++++++++
@@ -1907,7 +1942,9 @@ The return value of ``OpImageFetch`` is always a four-component vector; so
 proper additional instructions are generated to truncate the vector and return
 the desired number of elements.
 
-The overload with the status parameter are not supported.
+For the overload with the output unsigned integer ``status`` argument,
+``OpImageSparseFetch`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
 ``operator[]``
 ++++++++++++++
@@ -2032,6 +2069,10 @@ Common texture methods
 Since read-write texture types are represented as ``OpTypeImage`` with
 ``Sampled`` set to 2 (meaning to be used without a sampler), ``OpImageRead`` is
 used to perform this operation.
+
+For the overload with the output unsigned integer ``status`` argument,
+``OpImageSparseRead`` is used instead. The resulting SPIR-V
+``Residency Code`` will be written to ``status``.
 
 ``operator[]``
 ++++++++++++++
@@ -2279,8 +2320,6 @@ either because of no Vulkan equivalents at the moment, or because of deprecation
   emit a warning and ignore it.
 * ``abort()`` intrinsic function: no Vulkan equivalent. The compiler will emit
   an error.
-* ``CheckAccessFullyMapped()`` intrinsic function: no Vulkan equivalent.
-  The compiler will emit an error.
 * ``GetRenderTargetSampleCount()`` intrinsic function: no Vulkan equivalent.
   (Its GLSL counterpart is ``gl_NumSamples``, which is not available in GLSL for
   Vulkan.) The compiler will emit an error.
@@ -2300,3 +2339,13 @@ either because of no Vulkan equivalents at the moment, or because of deprecation
   sample currently being processed.) The compiler will emit an error.
 * ``SV_InnerCoverage`` semantic does not have a Vulkan equivalent. The compiler
   will emit an error.
+* Since ``StructuredBuffer``, ``RWStructuredBuffer``, ``ByteAddressBuffer``, and
+  ``RWByteAddressBuffer`` are not represented as image types in SPIR-V, using the
+  output unsigned integer ``status`` argument in their ``Load*`` methods is not
+  supported. Using these methods with the ``status`` argument will cause a compiler error.
+* Applying ``row_major`` or ``column_major`` attributes to a stand-alone matrix will be
+  ignored by the compiler because ``RowMajor`` and ``ColMajor`` decorations in SPIR-V are
+  only allowed to be applied to members of structures. A warning will be issued by the compiler.
+* The Hull shader ``partitioning`` attribute may not have the ``pow2`` value. The compiler
+  will emit an error. Other attribute values are supported and described in the
+  `Hull Entry Point Attributes`_ section.

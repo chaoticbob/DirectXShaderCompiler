@@ -177,6 +177,7 @@ const char *hlsl::GetValidationRuleText(ValidationRule value) {
     case hlsl::ValidationRule::InstrExtractValue: return "ExtractValue should only be used on dxil struct types and cmpxchg";
     case hlsl::ValidationRule::InstrTGSMRaceCond: return "Race condition writing to shared memory detected, consider making this write conditional";
     case hlsl::ValidationRule::InstrAttributeAtVertexNoInterpolation: return "Attribute %0 must have nointerpolation mode in order to use GetAttributeAtVertex function.";
+    case hlsl::ValidationRule::InstrCreateHandleImmRangeID: return "Local resource must map to global resource.";
     case hlsl::ValidationRule::TypesNoVector: return "Vector type '%0' is not allowed";
     case hlsl::ValidationRule::TypesDefined: return "Type '%0' is not defined on DXIL primitives";
     case hlsl::ValidationRule::TypesIntWidth: return "Int type '%0' has an invalid width";
@@ -762,6 +763,8 @@ static DXIL::ResourceKind GetResourceKindAndCompTy(Value *handle, DXIL::Componen
 
   Value *rangeIndex = createHandle.get_rangeId();
   if (!isa<ConstantInt>(rangeIndex)) {
+    ValCtx.EmitInstrError(cast<CallInst>(handle),
+                          ValidationRule::InstrCreateHandleImmRangeID);
     // must be constant
     return DXIL::ResourceKind::Invalid;
   }
@@ -3347,12 +3350,12 @@ static void ValidateSignatureElement(DxilSignatureElement &SE,
     }
     // NOTE: clip cull distance size is checked at ValidateSignature.
     break;
-  case DXIL::SemanticKind::IsFrontFace:
-    if (!compBool || SE.GetCols() != 1) {
+  case DXIL::SemanticKind::IsFrontFace: {
+    if (!(compInt && compWidth == 32) || SE.GetCols() != 1) {
       ValCtx.EmitFormatError(ValidationRule::MetaSemanticCompType,
-                             {SE.GetSemantic()->GetName(), "bool"});
+                             {SE.GetSemantic()->GetName(), "uint"});
     }
-    break;
+  } break;
   case DXIL::SemanticKind::RenderTargetArrayIndex:
   case DXIL::SemanticKind::ViewPortArrayIndex:
   case DXIL::SemanticKind::VertexID:

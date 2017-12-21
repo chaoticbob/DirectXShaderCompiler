@@ -237,12 +237,25 @@ private:
                                       const BinaryOperatorKind opcode,
                                       SourceRange);
 
+  /// Creates a temporary local variable in the current function of the given
+  /// varType and varName. Initializes the variable with the given initValue.
+  /// Returns the <result-id> of the variable.
+  uint32_t SPIRVEmitter::createTemporaryVar(QualType varType,
+                                            llvm::StringRef varName,
+                                            uint32_t initValue);
+
   /// Collects all indices (SPIR-V constant values) from consecutive MemberExprs
   /// or ArraySubscriptExprs or operator[] calls and writes into indices.
   /// Returns the real base.
   const Expr *
   collectArrayStructIndices(const Expr *expr,
                             llvm::SmallVectorImpl<uint32_t> *indices);
+
+  /// Creates an access chain to index into the given SPIR-V evaluation result
+  /// and overwrites and returns the new SPIR-V evaluation result.
+  SpirvEvalInfo &
+  turnIntoElementPtr(SpirvEvalInfo &info, QualType elemType,
+                     const llvm::SmallVector<uint32_t, 4> &indices);
 
 private:
   /// Validates that vk::* attributes are used correctly.
@@ -576,14 +589,6 @@ private:
   void processSwitchStmtUsingIfStmts(const SwitchStmt *switchStmt);
 
 private:
-  /// Handles the optional offset argument in the given method call at the given
-  /// argument index.
-  /// If there exists an offset argument, writes the <result-id> to either
-  /// *constOffset or *varOffset, depending on the constantness of the offset.
-  void handleOptionalOffsetInMethodCall(const CXXMemberCallExpr *expr,
-                                        uint32_t index, uint32_t *constOffset,
-                                        uint32_t *varOffset);
-
   /// Handles the offset argument in the given method call at the given argument
   /// index. Panics if the argument at the given index does not exist. Writes
   /// the <result-id> to either *constOffset or *varOffset, depending on the
@@ -598,10 +603,12 @@ private:
   /// \brief Loads one element from the given Buffer/RWBuffer/Texture object at
   /// the given location. The type of the loaded element matches the type in the
   /// declaration for the Buffer/Texture object.
+  /// If residencyCodeId is not zero,  the SPIR-V instruction for storing the
+  /// resulting residency code will also be emitted.
   SpirvEvalInfo processBufferTextureLoad(const Expr *object, uint32_t location,
-                                         uint32_t constOffset = 0,
-                                         uint32_t varOffst = 0,
-                                         uint32_t lod = 0);
+                                         uint32_t constOffset,
+                                         uint32_t varOffset, uint32_t lod,
+                                         uint32_t residencyCode);
 
   /// \brief Processes .Sample() and .Gather() method calls for texture objects.
   uint32_t processTextureSampleGather(const CXXMemberCallExpr *expr,
@@ -679,6 +686,30 @@ private:
   /// \brief Generates SPIR-V instructions to end emitting the current
   /// primitive in GS.
   uint32_t processStreamOutputRestart(const CXXMemberCallExpr *expr);
+
+private:
+  /// \brief Takes a vector of size 4, and returns a vector of size 1 or 2 or 3
+  /// or 4. Creates a CompositeExtract or VectorShuffle instruction to extract
+  /// a scalar or smaller vector from the beginning of the input vector if
+  /// necessary. Assumes that 'fromId' is the <result-id> of a vector of size 4.
+  /// Panics if the target vector size is not 1, 2, 3, or 4.
+  uint32_t extractVecFromVec4(uint32_t fromId, uint32_t targetVecSize,
+                              uint32_t targetElemTypeId);
+
+  /// \brief Creates SPIR-V instructions for sampling the given image.
+  /// It utilizes the ModuleBuilder's createImageSample and it ensures that the
+  /// returned type is handled correctly.
+  /// HLSL image sampling methods may return a scalar, vec1, vec2, vec3, or
+  /// vec4. But non-Dref image sampling instructions in SPIR-V must always
+  /// return a vec4. As a result, an extra processing step is necessary.
+  uint32_t createImageSample(QualType retType, uint32_t imageType,
+                             uint32_t image, uint32_t sampler,
+                             uint32_t coordinate, uint32_t compareVal,
+                             uint32_t bias, uint32_t lod,
+                             std::pair<uint32_t, uint32_t> grad,
+                             uint32_t constOffset, uint32_t varOffset,
+                             uint32_t constOffsets, uint32_t sample,
+                             uint32_t minLod, uint32_t residencyCodeId);
 
 private:
   /// \brief Wrapper method to create a fatal error message and report it
