@@ -111,6 +111,13 @@ public:
   uint32_t createCompositeExtract(uint32_t resultType, uint32_t composite,
                                   llvm::ArrayRef<uint32_t> indexes);
 
+  /// \brief Creates a composite insert instruction. The given object will
+  /// replace the component in the composite at the given indices. Returns the
+  /// <result-id> for the new composite.
+  uint32_t createCompositeInsert(uint32_t resultType, uint32_t composite,
+                                 llvm::ArrayRef<uint32_t> indices,
+                                 uint32_t object);
+
   /// \brief Creates a vector shuffle instruction of selecting from the two
   /// vectors using selectors and returns the <result-id> of the result vector.
   uint32_t createVectorShuffle(uint32_t resultType, uint32_t vector1,
@@ -144,6 +151,8 @@ public:
   /// the <result-id> for the result.
   uint32_t createBinaryOp(spv::Op op, uint32_t resultType, uint32_t lhs,
                           uint32_t rhs);
+  uint32_t createSpecConstantBinaryOp(spv::Op op, uint32_t resultType,
+                                      uint32_t lhs, uint32_t rhs);
 
   /// \brief Creates an atomic instruction with the given parameters.
   /// Returns the <result-id> for the result.
@@ -211,9 +220,9 @@ public:
   /// If compareVal is given a non-zero value, OpImageDrefGather or
   /// OpImageSparseDrefGather will be generated; otherwise, OpImageGather or
   /// OpImageSparseGather will be generated.
-  /// If residencyCodeId is not zero, the sparse version of the instructions will
-  /// be used, and the SPIR-V instruction for storing the resulting residency
-  /// code will also be emitted.
+  /// If residencyCodeId is not zero, the sparse version of the instructions
+  /// will be used, and the SPIR-V instruction for storing the resulting
+  /// residency code will also be emitted.
   uint32_t createImageGather(uint32_t texelType, uint32_t imageType,
                              uint32_t image, uint32_t sampler,
                              uint32_t coordinate, uint32_t component,
@@ -350,6 +359,13 @@ public:
   void decorateDSetBinding(uint32_t targetId, uint32_t setNumber,
                            uint32_t bindingNumber);
 
+  /// \brief Decorates the given target <result-id> with the given SpecId.
+  void decorateSpecId(uint32_t targetId, uint32_t specId);
+
+  /// \brief Decorates the given target <result-id> with the given input
+  /// attchment index number.
+  void decorateInputAttachmentIndex(uint32_t targetId, uint32_t indexNumber);
+
   /// \brief Decorates the given target <result-id> with the given decoration
   /// (without additional parameters).
   void decorate(uint32_t targetId, spv::Decoration);
@@ -358,10 +374,13 @@ public:
 
   uint32_t getVoidType();
   uint32_t getBoolType();
+  uint32_t getInt16Type();
   uint32_t getInt32Type();
   uint32_t getInt64Type();
+  uint32_t getUint16Type();
   uint32_t getUint32Type();
   uint32_t getUint64Type();
+  uint32_t getFloat16Type();
   uint32_t getFloat32Type();
   uint32_t getFloat64Type();
   uint32_t getVecType(uint32_t elemType, uint32_t elemCount);
@@ -390,10 +409,15 @@ public:
   uint32_t getSparseResidencyStructType(uint32_t type);
 
   // === Constant ===
-  uint32_t getConstantBool(bool value);
-  uint32_t getConstantInt32(int32_t value);
-  uint32_t getConstantUint32(uint32_t value);
-  uint32_t getConstantFloat32(float value);
+  uint32_t getConstantBool(bool value, bool isSpecConst = false);
+  uint32_t getConstantInt16(int16_t value);
+  uint32_t getConstantInt32(int32_t value, bool isSpecConst = false);
+  uint32_t getConstantInt64(int64_t value);
+  uint32_t getConstantUint16(uint16_t value);
+  uint32_t getConstantUint32(uint32_t value, bool isSpecConst = false);
+  uint32_t getConstantUint64(uint64_t value);
+  uint32_t getConstantFloat16(int16_t value);
+  uint32_t getConstantFloat32(float value, bool isSpecConst = false);
   uint32_t getConstantFloat64(double value);
   uint32_t getConstantComposite(uint32_t typeId,
                                 llvm::ArrayRef<uint32_t> constituents);

@@ -167,6 +167,13 @@ enum ArBasicKind {
   AR_OBJECT_ROVTEXTURE2D_ARRAY,
   AR_OBJECT_ROVTEXTURE3D,
 
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  AR_OBJECT_VK_SUBPASS_INPUT,
+  AR_OBJECT_VK_SUBPASS_INPUT_MS,
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
+
   AR_OBJECT_INNER,       // Used for internal type object
 
   AR_OBJECT_LEGACY_EFFECT,
@@ -417,6 +424,13 @@ const UINT g_uBasicKindProps[] =
   BPROP_OBJECT | BPROP_RWBUFFER | BPROP_ROVBUFFER,    // AR_OBJECT_ROVTEXTURE2D
   BPROP_OBJECT | BPROP_RWBUFFER | BPROP_ROVBUFFER,    // AR_OBJECT_ROVTEXTURE2D_ARRAY
   BPROP_OBJECT | BPROP_RWBUFFER | BPROP_ROVBUFFER,    // AR_OBJECT_ROVTEXTURE3D
+
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  BPROP_OBJECT | BPROP_RBUFFER,   // AR_OBJECT_VK_SUBPASS_INPUT
+  BPROP_OBJECT | BPROP_RBUFFER,   // AR_OBJECT_VK_SUBPASS_INPUT_MS
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
 
   BPROP_OBJECT,   // AR_OBJECT_INNER
 
@@ -994,6 +1008,8 @@ static const ArBasicKind g_AnyCT[] =
   AR_BASIC_MIN10FLOAT,
   AR_BASIC_MIN16FLOAT,
   AR_BASIC_LITERAL_INT,
+  AR_BASIC_INT16,
+  AR_BASIC_UINT16,
   AR_BASIC_INT32,
   AR_BASIC_UINT32,
   AR_BASIC_MIN12INT,
@@ -1201,6 +1217,13 @@ const ArBasicKind g_ArBasicKindsAsTypes[] =
   AR_OBJECT_ROVTEXTURE2D_ARRAY,
   AR_OBJECT_ROVTEXTURE3D,
 
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  AR_OBJECT_VK_SUBPASS_INPUT,
+  AR_OBJECT_VK_SUBPASS_INPUT_MS,
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
+
   AR_OBJECT_LEGACY_EFFECT,      // Used for all unsupported but ignored legacy effect types
 
   AR_OBJECT_WAVE
@@ -1261,6 +1284,13 @@ const uint8_t g_ArBasicKindsTemplateCount[] =
   1, // AR_OBJECT_ROVTEXTURE2D
   1, // AR_OBJECT_ROVTEXTURE2D_ARRAY
   1, // AR_OBJECT_ROVTEXTURE3D
+
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  1, // AR_OBJECT_VK_SUBPASS_INPUT
+  1, // AR_OBJECT_VK_SUBPASS_INPUT_MS
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
 
   0, // AR_OBJECT_LEGACY_EFFECT   // Used for all unsupported but ignored legacy effect types
   0, // AR_OBJECT_WAVE
@@ -1331,6 +1361,13 @@ const SubscriptOperatorRecord g_ArBasicKindsSubscripts[] =
   { 2, MipsFalse, SampleFalse }, // AR_OBJECT_ROVTEXTURE2D (ROVTexture2D)
   { 3, MipsFalse, SampleFalse }, // AR_OBJECT_ROVTEXTURE2D_ARRAY (ROVTexture2DArray)
   { 3, MipsFalse, SampleFalse }, // AR_OBJECT_ROVTEXTURE3D (ROVTexture3D)
+
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  { 0, MipsFalse, SampleFalse }, // AR_OBJECT_VK_SUBPASS_INPUT (SubpassInput)
+  { 0, MipsFalse, SampleFalse }, // AR_OBJECT_VK_SUBPASS_INPUT_MS (SubpassInputMS)
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
 
   { 0, MipsFalse, SampleFalse }, // AR_OBJECT_LEGACY_EFFECT (legacy effect objects)
   { 0, MipsFalse, SampleFalse }  // AR_OBJECT_WAVE
@@ -1420,6 +1457,13 @@ const char* g_ArBasicTypeNames[] =
   "RasterizerOrderedTexture2D",
   "RasterizerOrderedTexture2DArray",
   "RasterizerOrderedTexture3D",
+
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  "SubpassInput",
+  "SubpassInputMS",
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
 
   "<internal inner type object>",
 
@@ -2021,6 +2065,18 @@ void GetIntrinsicMethods(ArBasicKind kind, _Outptr_result_buffer_(*intrinsicCoun
     *intrinsics = g_ConsumeStructuredBufferMethods;
     *intrinsicCount = _countof(g_ConsumeStructuredBufferMethods);
     break;
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  case AR_OBJECT_VK_SUBPASS_INPUT:
+    *intrinsics = g_VkSubpassInputMethods;
+    *intrinsicCount = _countof(g_VkSubpassInputMethods);
+    break;
+  case AR_OBJECT_VK_SUBPASS_INPUT_MS:
+    *intrinsics = g_VkSubpassInputMSMethods;
+    *intrinsicCount = _countof(g_VkSubpassInputMSMethods);
+    break;
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
   default:
     *intrinsics = nullptr;
     *intrinsicCount = 0;
@@ -2100,11 +2156,24 @@ bool DoesIntrinsicRequireTemplate(const HLSL_INTRINSIC* intrinsic)
 static
 bool TemplateHasDefaultType(ArBasicKind kind)
 {
-  return
-    kind == AR_OBJECT_BUFFER ||
-    kind == AR_OBJECT_TEXTURE1D || kind == AR_OBJECT_TEXTURE2D || kind == AR_OBJECT_TEXTURE3D ||
-    kind == AR_OBJECT_TEXTURE1D_ARRAY || kind == AR_OBJECT_TEXTURE2D_ARRAY ||
-    kind == AR_OBJECT_TEXTURECUBE || kind == AR_OBJECT_TEXTURECUBE_ARRAY;
+  switch (kind) {
+  case AR_OBJECT_BUFFER:
+  case AR_OBJECT_TEXTURE1D:
+  case AR_OBJECT_TEXTURE2D:
+  case AR_OBJECT_TEXTURE3D:
+  case AR_OBJECT_TEXTURE1D_ARRAY:
+  case AR_OBJECT_TEXTURE2D_ARRAY:
+  case AR_OBJECT_TEXTURECUBE:
+  case AR_OBJECT_TEXTURECUBE_ARRAY:
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  case AR_OBJECT_VK_SUBPASS_INPUT:
+  case AR_OBJECT_VK_SUBPASS_INPUT_MS:
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
+    return true;
+  }
+  return false;
 }
 
 /// <summary>
@@ -3041,12 +3110,14 @@ public:
     return m_sema;
   }
 
-  TypedefDecl* LookupScalarType(HLSLScalarType scalarType) {
+  TypedefDecl* LookupScalarTypeDef(HLSLScalarType scalarType) {
+    // We shouldn't create Typedef for built in scalar types.
+    // For built in scalar types, this funciton may be called for
+    // TypoCorrection. In that case, we return a nullptr.
     if (m_scalarTypes[scalarType].isNull()) {
       m_scalarTypeDefs[scalarType] = CreateGlobalTypedef(m_context, HLSLScalarTypeNames[scalarType], m_baseTypes[scalarType]);
       m_scalarTypes[scalarType] = m_context->getTypeDeclType(m_scalarTypeDefs[scalarType]);
     }
-    DXASSERT(m_scalarTypeDefs[scalarType], "Otherwise we did not build scalar types correctly.");
     return m_scalarTypeDefs[scalarType];
   }
 
@@ -3056,7 +3127,7 @@ public:
     if (qt.isNull()) {
       // lazy initialization of scalar types 
       if (m_scalarTypes[scalarType].isNull()) {
-        LookupScalarType(scalarType);
+        LookupScalarTypeDef(scalarType);
       }
       qt = GetOrCreateMatrixSpecialization(*m_context, m_sema, m_matrixTemplateDecl, m_scalarTypes[scalarType], rowCount, colCount);
       m_matrixTypes[scalarType][rowCount - 1][colCount - 1] = qt;
@@ -3069,7 +3140,7 @@ public:
     QualType qt = m_vectorTypes[scalarType][colCount - 1];
     if (qt.isNull()) {
       if (m_scalarTypes[scalarType].isNull()) {
-        LookupScalarType(scalarType);
+        LookupScalarTypeDef(scalarType);
       }
       qt = GetOrCreateVectorSpecialization(*m_context, m_sema, m_vectorTemplateDecl, m_scalarTypes[scalarType], colCount);
       m_vectorTypes[scalarType][colCount - 1] = qt;
@@ -3166,7 +3237,8 @@ public:
     if (TryParseAny(nameIdentifier.data(), nameIdentifier.size(), &parsedType, &rowCount, &colCount, getSema()->getLangOpts())) {
       assert(parsedType != HLSLScalarType_unknown && "otherwise, TryParseHLSLScalarType should not have succeeded.");
       if (rowCount == 0 && colCount == 0) { // scalar
-        TypedefDecl *typeDecl = LookupScalarType(parsedType);
+        TypedefDecl *typeDecl = LookupScalarTypeDef(parsedType);
+        if (!typeDecl) return false;
         R.addDecl(typeDecl);
       }
       else if (rowCount == 0) { // vector
@@ -3648,6 +3720,7 @@ public:
     _In_ const HLSL_INTRINSIC *pIntrinsic,
     _In_ QualType objectElement);
 
+  // Returns the iterator with the first entry that matches the requirement
   IntrinsicDefIter FindIntrinsicByNameAndArgCount(
     _In_count_(tableSize) const HLSL_INTRINSIC* table,
     size_t tableSize,
@@ -3655,7 +3728,14 @@ public:
     StringRef nameIdentifier,
     size_t argumentCount)
   {
-    // TODO: avoid linear scan
+    // This is implemented by a linear scan for now.
+    // We tested binary search on tables, and there was no performance gain on
+    // samples probably for the following reasons.
+    // 1. The tables are not big enough to make noticable difference
+    // 2. The user of this function assumes that it returns the first entry in
+    // the table that matches name and argument count. So even in the binary
+    // search, we have to scan backwards until the entry does not match the name
+    // or arg count. For linear search this is not a problem
     for (unsigned int i = 0; i < tableSize; i++) {
       const HLSL_INTRINSIC* pIntrinsic = &table[i];
 
@@ -4705,6 +4785,8 @@ static ArBasicKind LiteralToConcrete(Expr *litExpr,
         kind = ArBasicKind::AR_BASIC_INT64;
     }
     return kind;
+  } else if (HLSLVectorElementExpr *VEE = dyn_cast<HLSLVectorElementExpr>(litExpr)) {
+    return pHLSLExternalSource->GetTypeElementKind(VEE->getType());
   } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(litExpr)) {
     ArBasicKind kind = LiteralToConcrete(BO->getLHS(), pHLSLExternalSource);
     ArBasicKind kind1 = LiteralToConcrete(BO->getRHS(), pHLSLExternalSource);
@@ -10385,6 +10467,15 @@ void hlsl::HandleDeclAttributeForHLSL(Sema &S, Decl *D, const AttributeList &A, 
     declAttr = ::new (S.Context) VKOffsetAttr(A.getRange(), S.Context,
       ValidateAttributeIntArg(S, A), A.getAttributeSpellingListIndex());
     break;
+  case AttributeList::AT_VKInputAttachmentIndex:
+    declAttr = ::new (S.Context) VKInputAttachmentIndexAttr(
+        A.getRange(), S.Context, ValidateAttributeIntArg(S, A),
+        A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_VKConstantId:
+    declAttr = ::new (S.Context) VKConstantIdAttr(A.getRange(), S.Context,
+      ValidateAttributeIntArg(S, A), A.getAttributeSpellingListIndex());
+    break;
   default:
     Handled = false;
     return;
@@ -11051,6 +11142,20 @@ bool Sema::DiagnoseHLSLDecl(Declarator &D, DeclContext *DC,
     Diag(D.getLocStart(), diag::err_hlsl_missing_inout_attr);
     result = false;
   }
+
+  // SPIRV change starts
+#ifdef ENABLE_SPIRV_CODEGEN
+  // Validate that Vulkan specific feature is only used when targeting SPIR-V
+  if (!getLangOpts().SPIRV) {
+    if (basicKind == ArBasicKind::AR_OBJECT_VK_SUBPASS_INPUT ||
+        basicKind == ArBasicKind::AR_OBJECT_VK_SUBPASS_INPUT_MS) {
+      Diag(D.getLocStart(), diag::err_hlsl_vulkan_specific_feature)
+          << g_ArBasicTypeNames[basicKind];
+      result = false;
+    }
+  }
+#endif // ENABLE_SPIRV_CODEGEN
+  // SPIRV change ends
 
   // Validate unusual annotations.
   hlsl::DiagnoseUnusualAnnotationsForHLSL(*this, D.UnusualAnnotations);

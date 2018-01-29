@@ -11,8 +11,9 @@
 
 #include "dxc/HLSL/DxilGenerationPass.h"
 #include "dxc/HLSL/DxilOperations.h"
-#include "dxc/HLSL/DxilModule.h"
 #include "dxc/HLSL/DxilInstructions.h"
+#include "dxc/HLSL/DxilModule.h"
+#include "dxc/HLSL/DxilPIXPasses.h"
 
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/PassManager.h"
@@ -38,6 +39,8 @@ bool DxilReduceMSAAToSingleSample::runOnModule(Module &M)
   OP *HlslOP = DM.GetOP();
 
   // FP16 type doesn't have its own identity, and is covered by float type... 
+
+
   auto TextureLoadOverloads = std::vector<Type*>{ Type::getFloatTy(Ctx), Type::getInt16Ty(Ctx), Type::getInt32Ty(Ctx) };
 
   bool Modified = false;

@@ -309,6 +309,7 @@ public:
     CComPtr<AbstractMemoryStream> pOutputStream;
     CHeapPtr<wchar_t> DebugBlobName;
     DxcEtw_DXCompilerCompile_Start();
+    pSourceName = (pSourceName && *pSourceName) ? pSourceName : L"hlsl.hlsl"; // declared optional, so pick a default
     DxcThreadMalloc TM(m_pMalloc);
     IFC(hlsl::DxcGetBlobAsUtf8(pSource, &utf8Source));
 
@@ -464,13 +465,18 @@ public:
 #ifdef ENABLE_SPIRV_CODEGEN
       else if (opts.GenSPIRV) {
           clang::EmitSPIRVOptions spirvOpts;
+
           spirvOpts.codeGenHighLevel = opts.CodeGenHighLevel;
+          spirvOpts.disableValidation = opts.DisableValidation;
+          spirvOpts.invertY = opts.VkInvertY;
           spirvOpts.ignoreUnusedResources = opts.VkIgnoreUnusedResources;
+          spirvOpts.defaultRowMajor = opts.DefaultRowMajor;
           spirvOpts.stageIoOrder = opts.VkStageIoOrder;
           spirvOpts.bShift = opts.VkBShift;
           spirvOpts.tShift = opts.VkTShift;
           spirvOpts.sShift = opts.VkSShift;
           spirvOpts.uShift = opts.VkUShift;
+          spirvOpts.enable16BitTypes = opts.Enable16BitTypes;
           clang::EmitSPIRVAction action(spirvOpts);
           FrontendInputFile file(utf8SourceName.m_psz, IK_HLSL);
           action.BeginSourceFile(compiler, file);

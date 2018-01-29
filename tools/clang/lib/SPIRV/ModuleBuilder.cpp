@@ -10,7 +10,8 @@
 #include "clang/SPIRV/ModuleBuilder.h"
 
 #include "TypeTranslator.h"
-#include "spirv/1.0//spirv.hpp11"
+#include "spirv/unified1//spirv.hpp11"
+#include "clang/SPIRV/BitwiseCast.h"
 #include "clang/SPIRV/InstBuilder.h"
 #include "llvm/llvm_assert/assert.h"
 
@@ -148,6 +149,19 @@ ModuleBuilder::createCompositeExtract(uint32_t resultType, uint32_t composite,
   return resultId;
 }
 
+uint32_t ModuleBuilder::createCompositeInsert(uint32_t resultType,
+                                              uint32_t composite,
+                                              llvm::ArrayRef<uint32_t> indices,
+                                              uint32_t object) {
+  assert(insertPoint && "null insert point");
+  const uint32_t resultId = theContext.takeNextId();
+  instBuilder
+      .opCompositeInsert(resultType, resultId, object, composite, indices)
+      .x();
+  insertPoint->appendInstruction(std::move(constructSite));
+  return resultId;
+}
+
 uint32_t
 ModuleBuilder::createVectorShuffle(uint32_t resultType, uint32_t vector1,
                                    uint32_t vector2,
@@ -199,6 +213,13 @@ uint32_t ModuleBuilder::createUnaryOp(spv::Op op, uint32_t resultType,
   const uint32_t id = theContext.takeNextId();
   instBuilder.unaryOp(op, resultType, id, operand).x();
   insertPoint->appendInstruction(std::move(constructSite));
+  switch (op) {
+  case spv::Op::OpImageQuerySize:
+  case spv::Op::OpImageQueryLevels:
+  case spv::Op::OpImageQuerySamples:
+    requireCapability(spv::Capability::ImageQuery);
+    break;
+  }
   return id;
 }
 
@@ -208,6 +229,21 @@ uint32_t ModuleBuilder::createBinaryOp(spv::Op op, uint32_t resultType,
   const uint32_t id = theContext.takeNextId();
   instBuilder.binaryOp(op, resultType, id, lhs, rhs).x();
   insertPoint->appendInstruction(std::move(constructSite));
+  switch (op) {
+  case spv::Op::OpImageQueryLod:
+  case spv::Op::OpImageQuerySizeLod:
+    requireCapability(spv::Capability::ImageQuery);
+    break;
+  }
+  return id;
+}
+
+uint32_t ModuleBuilder::createSpecConstantBinaryOp(spv::Op op,
+                                                   uint32_t resultType,
+                                                   uint32_t lhs, uint32_t rhs) {
+  const uint32_t id = theContext.takeNextId();
+  instBuilder.specConstantBinaryOp(op, resultType, id, lhs, rhs).x();
+  theModule.addVariable(std::move(constructSite));
   return id;
 }
 
@@ -735,10 +771,20 @@ void ModuleBuilder::decorateDSetBinding(uint32_t targetId, uint32_t setNumber,
   d = Decoration::getBinding(theContext, bindingNumber);
   theModule.addDecoration(d, targetId);
 }
+void ModuleBuilder::decorateInputAttachmentIndex(uint32_t targetId,
+                                                 uint32_t indexNumber) {
+  const auto *d = Decoration::getInputAttachmentIndex(theContext, indexNumber);
+  theModule.addDecoration(d, targetId);
+}
 
 void ModuleBuilder::decorateLocation(uint32_t targetId, uint32_t location) {
   const Decoration *d =
       Decoration::getLocation(theContext, location, llvm::None);
+  theModule.addDecoration(d, targetId);
+}
+
+void ModuleBuilder::decorateSpecId(uint32_t targetId, uint32_t specId) {
+  const Decoration *d = Decoration::getSpecId(theContext, specId);
   theModule.addDecoration(d, targetId);
 }
 
@@ -773,14 +819,13 @@ void ModuleBuilder::decorate(uint32_t targetId, spv::Decoration decoration) {
 }
 
 #define IMPL_GET_PRIMITIVE_TYPE(ty)                                            \
-  \
-uint32_t ModuleBuilder::get##ty##Type() {                                      \
+                                                                               \
+  uint32_t ModuleBuilder::get##ty##Type() {                                    \
     const Type *type = Type::get##ty(theContext);                              \
     const uint32_t typeId = theContext.getResultIdForType(type);               \
     theModule.addType(type, typeId);                                           \
     return typeId;                                                             \
-  \
-}
+  }
 
 IMPL_GET_PRIMITIVE_TYPE(Void)
 IMPL_GET_PRIMITIVE_TYPE(Bool)
@@ -791,19 +836,23 @@ IMPL_GET_PRIMITIVE_TYPE(Float32)
 #undef IMPL_GET_PRIMITIVE_TYPE
 
 #define IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(ty, cap)                       \
-  \
-uint32_t ModuleBuilder::get##ty##Type() {                                      \
-    requireCapability(spv::Capability::cap);                                    \
+                                                                               \
+  uint32_t ModuleBuilder::get##ty##Type() {                                    \
+    requireCapability(spv::Capability::cap);                                   \
+    if (spv::Capability::cap == spv::Capability::Float16)                      \
+      theModule.addExtension("SPV_AMD_gpu_shader_half_float");                 \
     const Type *type = Type::get##ty(theContext);                              \
     const uint32_t typeId = theContext.getResultIdForType(type);               \
     theModule.addType(type, typeId);                                           \
     return typeId;                                                             \
-  \
-}
+  }
 
-IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(Float64, Float64)
 IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(Int64, Int64)
 IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(Uint64, Int64)
+IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(Float64, Float64)
+IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(Int16, Int16)
+IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(Uint16, Int16)
+IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(Float16, Float16)
 
 #undef IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY
 
@@ -944,10 +993,10 @@ uint32_t ModuleBuilder::getImageType(uint32_t sampledType, spv::Dim dim,
     } else {
       requireCapability(spv::Capability::Sampled1D);
     }
-  }
-
-  if (dim == spv::Dim::Buffer) {
+  } else if (dim == spv::Dim::Buffer) {
     requireCapability(spv::Capability::SampledBuffer);
+  } else if (dim == spv::Dim::SubpassData) {
+    requireCapability(spv::Capability::InputAttachment);
   }
 
   if (isArray && ms) {
@@ -1034,7 +1083,19 @@ uint32_t ModuleBuilder::getByteAddressBufferType(bool isRW) {
   return typeId;
 }
 
-uint32_t ModuleBuilder::getConstantBool(bool value) {
+uint32_t ModuleBuilder::getConstantBool(bool value, bool isSpecConst) {
+  if (isSpecConst) {
+    const uint32_t constId = theContext.takeNextId();
+    if (value) {
+      instBuilder.opSpecConstantTrue(getBoolType(), constId).x();
+    } else {
+      instBuilder.opSpecConstantFalse(getBoolType(), constId).x();
+    }
+
+    theModule.addVariable(std::move(constructSite));
+    return constId;
+  }
+
   const uint32_t typeId = getBoolType();
   const Constant *constant = value ? Constant::getTrue(theContext, typeId)
                                    : Constant::getFalse(theContext, typeId);
@@ -1045,23 +1106,50 @@ uint32_t ModuleBuilder::getConstantBool(bool value) {
 }
 
 #define IMPL_GET_PRIMITIVE_CONST(builderTy, cppTy)                             \
-  \
-uint32_t ModuleBuilder::getConstant##builderTy(cppTy value) {                  \
+                                                                               \
+  uint32_t ModuleBuilder::getConstant##builderTy(cppTy value) {                \
     const uint32_t typeId = get##builderTy##Type();                            \
     const Constant *constant =                                                 \
         Constant::get##builderTy(theContext, typeId, value);                   \
     const uint32_t constId = theContext.getResultIdForConstant(constant);      \
     theModule.addConstant(constant, constId);                                  \
     return constId;                                                            \
-  \
-}
+  }
 
-IMPL_GET_PRIMITIVE_CONST(Int32, int32_t)
-IMPL_GET_PRIMITIVE_CONST(Uint32, uint32_t)
-IMPL_GET_PRIMITIVE_CONST(Float32, float)
+#define IMPL_GET_PRIMITIVE_CONST_SPEC_CONST(builderTy, cppTy)                  \
+                                                                               \
+  uint32_t ModuleBuilder::getConstant##builderTy(cppTy value,                  \
+                                                 bool isSpecConst) {           \
+    if (isSpecConst) {                                                         \
+      const uint32_t constId = theContext.takeNextId();                        \
+      instBuilder                                                              \
+          .opSpecConstant(get##builderTy##Type(), constId,                     \
+                          cast::BitwiseCast<uint32_t>(value))                  \
+          .x();                                                                \
+      theModule.addVariable(std::move(constructSite));                         \
+      return constId;                                                          \
+    }                                                                          \
+                                                                               \
+    const uint32_t typeId = get##builderTy##Type();                            \
+    const Constant *constant =                                                 \
+        Constant::get##builderTy(theContext, typeId, value);                   \
+    const uint32_t constId = theContext.getResultIdForConstant(constant);      \
+    theModule.addConstant(constant, constId);                                  \
+    return constId;                                                            \
+  }
+
+IMPL_GET_PRIMITIVE_CONST(Int16, int16_t)
+IMPL_GET_PRIMITIVE_CONST_SPEC_CONST(Int32, int32_t)
+IMPL_GET_PRIMITIVE_CONST(Uint16, uint16_t)
+IMPL_GET_PRIMITIVE_CONST_SPEC_CONST(Uint32, uint32_t)
+IMPL_GET_PRIMITIVE_CONST(Float16, int16_t)
+IMPL_GET_PRIMITIVE_CONST_SPEC_CONST(Float32, float)
 IMPL_GET_PRIMITIVE_CONST(Float64, double)
+IMPL_GET_PRIMITIVE_CONST(Int64, int64_t)
+IMPL_GET_PRIMITIVE_CONST(Uint64, uint64_t)
 
-#undef IMPL_GET_PRIMITIVE_VALUE
+#undef IMPL_GET_PRIMITIVE_CONST
+#undef IMPL_GET_PRIMITIVE_CONST_SPEC_CONST
 
 uint32_t
 ModuleBuilder::getConstantComposite(uint32_t typeId,

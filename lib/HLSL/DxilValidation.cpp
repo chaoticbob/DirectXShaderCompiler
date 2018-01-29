@@ -234,7 +234,7 @@ const char *hlsl::GetValidationRuleText(ValidationRule value) {
     case hlsl::ValidationRule::SmResourceRangeOverlap: return "Resource %0 with base %1 size %2 overlap with other resource with base %3 size %4 in space %5";
     case hlsl::ValidationRule::SmCBufferOffsetOverlap: return "CBuffer %0 has offset overlaps at %1";
     case hlsl::ValidationRule::SmCBufferElementOverflow: return "CBuffer %0 size insufficient for element at offset %1";
-    case hlsl::ValidationRule::SmOpcodeInInvalidFunction: return "opcode '%0' should only used in '%1'";
+    case hlsl::ValidationRule::SmOpcodeInInvalidFunction: return "opcode '%0' should only be used in '%1'";
     case hlsl::ValidationRule::SmViewIDNeedsSlot: return "Pixel shader input signature lacks available space for ViewID";
     case hlsl::ValidationRule::UniNoWaveSensitiveGradient: return "Gradient operations are not affected by wave-sensitive data or control flow.";
     case hlsl::ValidationRule::FlowReducible: return "Execution flow must be reducible";
@@ -1920,6 +1920,16 @@ static void ValidateDxilOperationCallInProfile(CallInst *CI,
   case DXIL::OpCode::ViewID:
     ValCtx.hasViewID = true;
     break;
+  case DXIL::OpCode::QuadOp:
+    if (!pSM->IsPS())
+      ValCtx.EmitFormatError(ValidationRule::SmOpcodeInInvalidFunction,
+                             {"QuadReadAcross", "Pixel Shader"});
+    break;
+  case DXIL::OpCode::QuadReadLaneAt:
+    if (!pSM->IsPS())
+      ValCtx.EmitFormatError(ValidationRule::SmOpcodeInInvalidFunction,
+                             {"QuadReadLaneAt", "Pixel Shader"});
+    break;
   default:
     // Skip opcodes don't need special check.
     break;
@@ -2371,16 +2381,33 @@ static void ValidateInstructionMetadata(Instruction *I,
 }
 
 static void ValidateFunctionAttribute(Function *F, ValidationContext &ValCtx) {
-  AttributeSet attrSet = F->getAttributes();
+  AttributeSet attrSet = F->getAttributes().getFnAttributes();
   // fp32-denorm-mode
-  if (attrSet.hasAttribute(AttributeSet::FunctionIndex, DXIL::kFP32DenormKindString)) {
-    Attribute attr = attrSet.getAttribute(AttributeSet::FunctionIndex, DXIL::kFP32DenormKindString);
+  if (attrSet.hasAttribute(AttributeSet::FunctionIndex,
+                           DXIL::kFP32DenormKindString)) {
+    Attribute attr = attrSet.getAttribute(AttributeSet::FunctionIndex,
+                                          DXIL::kFP32DenormKindString);
     StringRef value = attr.getValueAsString();
     if (!value.equals(DXIL::kFP32DenormValueAnyString) &&
-      !value.equals(DXIL::kFP32DenormValueFtzString) &&
-      !value.equals(DXIL::kFP32DenormValuePreserveString))
-    {
-      ValCtx.EmitFnAttributeError(F, attr.getKindAsString(), attr.getValueAsString());
+        !value.equals(DXIL::kFP32DenormValueFtzString) &&
+        !value.equals(DXIL::kFP32DenormValuePreserveString)) {
+      ValCtx.EmitFnAttributeError(F, attr.getKindAsString(),
+                                  attr.getValueAsString());
+    }
+  }
+  // TODO: If validating libraries, we should remove all unknown function attributes.
+  // For each attribute, check if it is a known attribute
+  for (unsigned I = 0, E = attrSet.getNumSlots(); I != E; ++I) {
+    for (auto AttrIter = attrSet.begin(I), AttrEnd = attrSet.end(I);
+         AttrIter != AttrEnd; ++AttrIter) {
+      if (!AttrIter->isStringAttribute()) {
+        continue;
+      }
+      StringRef kind = AttrIter->getKindAsString();
+      if (!kind.equals(DXIL::kFP32DenormKindString)) {
+        ValCtx.EmitFnAttributeError(F, AttrIter->getKindAsString(),
+                                    AttrIter->getValueAsString());
+      }
     }
   }
 }

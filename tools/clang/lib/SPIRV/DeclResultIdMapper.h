@@ -16,7 +16,7 @@
 #include "dxc/HLSL/DxilSemantic.h"
 #include "dxc/HLSL/DxilShaderModel.h"
 #include "dxc/HLSL/DxilSigPoint.h"
-#include "spirv/1.0/spirv.hpp11"
+#include "spirv/unified1/spirv.hpp11"
 #include "clang/AST/Attr.h"
 #include "clang/SPIRV/EmitSPIRVOptions.h"
 #include "clang/SPIRV/ModuleBuilder.h"
@@ -131,6 +131,108 @@ private:
   bool isCounterVar;                          ///< Couter variable or not
 };
 
+/// A (<result-id>, is-alias-or-not) pair for counter variables
+class CounterIdAliasPair {
+public:
+  /// Default constructor to satisfy llvm::DenseMap
+  CounterIdAliasPair() : resultId(0), isAlias(false) {}
+  CounterIdAliasPair(uint32_t id, bool alias) : resultId(id), isAlias(alias) {}
+
+  /// Returns the pointer to the counter variable. Dereferences first if this is
+  /// an alias to a counter variable.
+  uint32_t get(ModuleBuilder &builder, TypeTranslator &translator) const;
+
+  /// Stores the counter variable's pointer in srcPair to the curent counter
+  /// variable. The current counter variable must be an alias.
+  inline void assign(const CounterIdAliasPair &srcPair, ModuleBuilder &builder,
+                     TypeTranslator &translator) const;
+
+private:
+  uint32_t resultId;
+  /// Note: legalization specific code
+  bool isAlias;
+};
+
+/// A class for holding all the counter variables associated with a struct's
+/// fields
+///
+/// A alias local RW/Append/Consume structured buffer will need an associated
+/// counter variable generated. There are four forms such an alias buffer can
+/// be:
+///
+/// 1 (AssocCounter#1). A stand-alone variable,
+/// 2 (AssocCounter#2). A struct field,
+/// 3 (AssocCounter#3). A struct containing alias fields,
+/// 4 (AssocCounter#4). A nested struct containing alias fields.
+///
+/// We consider the first two cases as *final* alias entities; The last two
+/// cases are called as *intermediate* alias entities, since we can still
+/// decompose them and get final alias entities.
+///
+/// We need to create an associated counter variable no matter which form the
+/// alias buffer is in, which means we need to recursively visit all fields of a
+/// struct to discover if it's not AssocCounter#1. That means a hierarchy.
+///
+/// The purpose of this class is to provide such hierarchy in a *flattened* way.
+/// Each field's associated counter is represented with an index vector and the
+/// counter's <result-id>. For example, for the following structs,
+///
+/// struct S {
+///       RWStructuredBuffer s1;
+///   AppendStructuredBuffer s2;
+/// };
+///
+/// struct T {
+///   S t1;
+///   S t2;
+/// };
+///
+/// An instance of T will have four associated counters for
+///   field: indices, <result-id>
+///   t1.s1: [0, 0], <id-1>
+///   t1.s2: [0, 1], <id-2>
+///   t2.s1: [1, 0], <id-3>
+///   t2.s2: [1, 1], <id-4>
+class CounterVarFields {
+public:
+  CounterVarFields() = default;
+
+  /// Registers a field's associated counter.
+  void append(const llvm::SmallVector<uint32_t, 4> &indices, uint32_t counter) {
+    fields.emplace_back(indices, counter);
+  }
+
+  /// Returns the counter associated with the field at the given indices if it
+  /// has. Returns nullptr otherwise.
+  const CounterIdAliasPair *
+  get(const llvm::SmallVectorImpl<uint32_t> &indices) const;
+
+  /// Assigns to all the fields' associated counter from the srcFields.
+  /// Returns true if there are no errors during the assignment.
+  ///
+  /// This first overload is for assigning a struct as whole: we need to update
+  /// all the associated counters in the target struct. This second overload is
+  /// for assigning a potentially nested struct.
+  bool assign(const CounterVarFields &srcFields, ModuleBuilder &builder,
+              TypeTranslator &translator) const;
+  bool assign(const CounterVarFields &srcFields,
+              const llvm::SmallVector<uint32_t, 4> &dstPrefix,
+              const llvm::SmallVector<uint32_t, 4> &srcPrefix,
+              ModuleBuilder &builder, TypeTranslator &translator) const;
+
+private:
+  struct IndexCounterPair {
+    IndexCounterPair(const llvm::SmallVector<uint32_t, 4> &idx,
+                     uint32_t counter)
+        : indices(idx), counterVar(counter, true) {}
+
+    llvm::SmallVector<uint32_t, 4> indices; ///< Index vector
+    CounterIdAliasPair counterVar;          ///< Counter variable information
+  };
+
+  llvm::SmallVector<IndexCounterPair, 4> fields;
+};
+
 /// \brief The class containing mappings from Clang frontend Decls to their
 /// corresponding SPIR-V <result-id>s.
 ///
@@ -180,6 +282,13 @@ public:
   /// returns its <result-id>.
   uint32_t createFnParam(const ParmVarDecl *param);
 
+  /// \brief Creates the counter variable associated with the given param.
+  /// This is meant to be used for forward-declared functions and this objects
+  /// of methods.
+  ///
+  /// Note: legalization specific code
+  inline void createFnParamCounterVar(const VarDecl *param);
+
   /// \brief Creates a function-scope variable in the current function and
   /// returns its <result-id>.
   uint32_t createFnVar(const VarDecl *var, llvm::Optional<uint32_t> init);
@@ -214,6 +323,21 @@ public:
   /// \brief Creates a PushConstant block from the given decl.
   uint32_t createPushConstant(const VarDecl *decl);
 
+  /// \brief Returns the suitable type for the given decl, considering the
+  /// given decl could possibly be created as an alias variable. If true, a
+  /// pointer-to-the-value type will be returned, otherwise, just return the
+  /// normal value type. For an alias variable having a associated counter, the
+  /// counter variable will also be emitted.
+  ///
+  /// If the type is for an alias variable, writes true to *shouldBeAlias and
+  /// writes storage class, layout rule, and valTypeId to *info.
+  ///
+  /// Note: legalization specific code
+  uint32_t
+  getTypeAndCreateCounterForPotentialAliasVar(const DeclaratorDecl *var,
+                                              bool *shouldBeAlias = nullptr,
+                                              SpirvEvalInfo *info = nullptr);
+
   /// \brief Sets the <result-id> of the entry function.
   void setEntryFunctionId(uint32_t id) { entryFunctionId = id; }
 
@@ -223,8 +347,8 @@ private:
     /// Default constructor to satisfy DenseMap
     DeclSpirvInfo() : info(0), indexInCTBuffer(-1) {}
 
-    DeclSpirvInfo(const SpirvEvalInfo &info_, int index = -1)
-        : info(info_), indexInCTBuffer(index) {}
+    DeclSpirvInfo(const SpirvEvalInfo &info_, int index = -1, bool row = false)
+        : info(info_), indexInCTBuffer(index), isRowMajor(row) {}
 
     /// Implicit conversion to SpirvEvalInfo.
     operator SpirvEvalInfo() const { return info; }
@@ -233,6 +357,8 @@ private:
     /// Value >= 0 means that this decl is a VarDecl inside a cbuffer/tbuffer
     /// and this is the index; value < 0 means this is just a standalone decl.
     int indexInCTBuffer;
+    /// Whether this decl should be row major.
+    bool isRowMajor;
   };
 
   /// \brief Returns the SPIR-V information for the given decl.
@@ -245,7 +371,7 @@ public:
   ///
   /// This method will emit a fatal error if checkRegistered is true and the
   /// decl is not registered.
-  SpirvEvalInfo getDeclResultId(const ValueDecl *decl,
+  SpirvEvalInfo getDeclEvalInfo(const ValueDecl *decl,
                                 bool checkRegistered = true);
 
   /// \brief Returns the <result-id> for the given function if already
@@ -253,9 +379,23 @@ public:
   /// returns a newly assigned <result-id> for it.
   uint32_t getOrRegisterFnResultId(const FunctionDecl *fn);
 
-  /// \brief Returns the associated counter's <result-id> for the given
-  /// {RW|Append|Consume}StructuredBuffer variable.
-  uint32_t getOrCreateCounterId(const ValueDecl *decl);
+  /// Registers that the given decl should be translated into the given spec
+  /// constant.
+  void registerSpecConstant(const VarDecl *decl, uint32_t specConstant);
+
+  /// \brief Returns the associated counter's (<result-id>, is-alias-or-not)
+  /// pair for the given {RW|Append|Consume}StructuredBuffer variable.
+  /// If indices is not nullptr, walks trhough the fields of the decl, expected
+  /// to be of struct type, using the indices to find the field. Returns nullptr
+  /// if the given decl has no associated counter variable created.
+  const CounterIdAliasPair *getCounterIdAliasPair(
+      const DeclaratorDecl *decl,
+      const llvm::SmallVector<uint32_t, 4> *indices = nullptr);
+
+  /// \brief Returns all the associated counters for the given decl. The decl is
+  /// expected to be a struct containing alias RW/Append/Consume structured
+  /// buffers. Returns nullptr if it does not.
+  const CounterVarFields *getCounterVarFields(const DeclaratorDecl *decl);
 
   /// \brief Returns the <type-id> for the given cbuffer, tbuffer,
   /// ConstantBuffer, TextureBuffer, or push constant block.
@@ -299,6 +439,8 @@ public:
   /// This method will write the set and binding number assignment into the
   /// module under construction.
   bool decorateResourceBindings();
+
+  bool requiresLegalization() const { return needsLegalization; }
 
 private:
   /// \brief Wrapper method to create a fatal error message and report it
@@ -427,9 +569,29 @@ private:
   bool validateVKBuiltins(const DeclaratorDecl *decl,
                           const hlsl::SigPoint *sigPoint);
 
-  /// Creates the associated counter variable for RW/Append/Consume
-  /// structured buffer.
-  uint32_t createCounterVar(const ValueDecl *decl);
+  /// Methods for creating counter variables associated with the given decl.
+
+  /// Creates assoicated counter variables for all AssocCounter cases (see the
+  /// comment of CounterVarFields). fields.
+  void createCounterVarForDecl(const DeclaratorDecl *decl);
+  /// Creates the associated counter variable for final RW/Append/Consume
+  /// structured buffer. Handles AssocCounter#1 and AssocCounter#2 (see the
+  /// comment of CounterVarFields).
+  ///
+  /// The counter variable will be created as an alias variable (of
+  /// pointer-to-pointer type in Private storage class) if isAlias is true.
+  ///
+  /// Note: isAlias - legalization specific code
+  void
+  createCounterVar(const DeclaratorDecl *decl, bool isAlias,
+                   const llvm::SmallVector<uint32_t, 4> *indices = nullptr);
+  /// Creates all assoicated counter variables by recursively visiting decl's
+  /// fields. Handles AssocCounter#3 and AssocCounter#4 (see the comment of
+  /// CounterVarFields).
+  inline void createFieldCounterVars(const DeclaratorDecl *decl);
+  void createFieldCounterVars(const DeclaratorDecl *rootDecl,
+                              const DeclaratorDecl *decl,
+                              llvm::SmallVector<uint32_t, 4> *indices);
 
   /// Decorates varId of the given asType with proper interpolation modes
   /// considering the attributes on the given decl.
@@ -469,17 +631,78 @@ private:
   /// Vector of all defined resource variables.
   llvm::SmallVector<ResourceVar, 8> resourceVars;
   /// Mapping from {RW|Append|Consume}StructuredBuffers to their
-  /// counter variables
-  llvm::DenseMap<const ValueDecl *, uint32_t> counterVars;
+  /// counter variables' (<result-id>, is-alias-or-not) pairs
+  ///
+  /// conterVars holds entities of AssocCounter#1, fieldCounterVars holds
+  /// entities of the rest.
+  llvm::DenseMap<const DeclaratorDecl *, CounterIdAliasPair> counterVars;
+  llvm::DenseMap<const DeclaratorDecl *, CounterVarFields> fieldCounterVars;
 
   /// Mapping from cbuffer/tbuffer/ConstantBuffer/TextureBufer/push-constant
   /// to the <type-id>
   llvm::DenseMap<const DeclContext *, uint32_t> ctBufferPCTypeIds;
 
+  /// Whether the translated SPIR-V binary needs legalization.
+  ///
+  /// The following cases will require legalization:
+  ///
+  /// 1. Opaque types (textures, samplers) within structs
+  /// 2. Structured buffer assignments
+  ///
+  /// This covers the second case:
+  ///
+  /// When we have a kind of structured or byte buffer, meaning one of the
+  /// following
+  ///
+  /// * StructuredBuffer
+  /// * RWStructuredBuffer
+  /// * AppendStructuredBuffer
+  /// * ConsumeStructuredBuffer
+  /// * ByteAddressStructuredBuffer
+  /// * RWByteAddressStructuredBuffer
+  ///
+  /// and assigning to them (using operator=, passing in as function parameter,
+  /// returning as function return), we need legalization.
+  ///
+  /// All variable definitions (including static/non-static local/global
+  /// variables, function parameters/returns) will gain another level of
+  /// pointerness, unless they will generate externally visible SPIR-V
+  /// variables. So variables and parameters will be of pointer-to-pointer type,
+  /// while function returns will be of pointer type. We adopt this mechanism to
+  /// convey to the legalization passes that they are *alias* variables, and
+  /// all accesses should happen to the aliased-to-variables. Loading such an
+  /// alias variable will give the pointer to the aliased-to-variable, while
+  /// storing into such an alias variable should write the pointer to the
+  /// aliased-to-variable.
+  ///
+  /// Based on the above, CodeGen should take care of the following AST nodes:
+  ///
+  /// * Definition of alias variables: should add another level of pointers
+  /// * Assigning non-alias variables to alias variables: should avoid the load
+  ///   over the non-alias variables
+  /// * Accessing alias variables: should load the pointer first and then
+  ///   further compose access chains.
+  ///
+  /// Note that the associated counters bring about their own complication.
+  /// We also need to apply the alias mechanism for them.
+  ///
+  /// If this is true, SPIRV-Tools legalization passes will be executed after
+  /// the translation to legalize the generated SPIR-V binary.
+  ///
+  /// Note: legalization specific code
+  bool needsLegalization;
+
 public:
   /// The gl_PerVertex structs for both input and output
   GlPerVertex glPerVertex;
 };
+
+void CounterIdAliasPair::assign(const CounterIdAliasPair &srcPair,
+                                ModuleBuilder &builder,
+                                TypeTranslator &translator) const {
+  assert(isAlias);
+  builder.createStore(resultId, srcPair.get(builder, translator));
+}
 
 DeclResultIdMapper::DeclResultIdMapper(const hlsl::ShaderModel &model,
                                        ASTContext &context,
@@ -487,8 +710,9 @@ DeclResultIdMapper::DeclResultIdMapper(const hlsl::ShaderModel &model,
                                        const EmitSPIRVOptions &options)
     : shaderModel(model), theBuilder(builder), spirvOptions(options),
       astContext(context), diags(context.getDiagnostics()),
-      typeTranslator(context, builder, diags), entryFunctionId(0),
-      glPerVertex(model, context, builder, typeTranslator) {}
+      typeTranslator(context, builder, diags, options), entryFunctionId(0),
+      needsLegalization(false),
+      glPerVertex(model, context, builder, typeTranslator, options.invertY) {}
 
 bool DeclResultIdMapper::decorateStageIOLocations() {
   // Try both input and output even if input location assignment failed
@@ -498,6 +722,15 @@ bool DeclResultIdMapper::decorateStageIOLocations() {
 bool DeclResultIdMapper::isInputStorageClass(const StageVar &v) {
   return getStorageClassForSigPoint(v.getSigPoint()) ==
          spv::StorageClass::Input;
+}
+
+void DeclResultIdMapper::createFnParamCounterVar(const VarDecl *param) {
+  createCounterVarForDecl(param);
+}
+
+void DeclResultIdMapper::createFieldCounterVars(const DeclaratorDecl *decl) {
+  llvm::SmallVector<uint32_t, 4> indices;
+  createFieldCounterVars(decl, decl, &indices);
 }
 
 } // end namespace spirv

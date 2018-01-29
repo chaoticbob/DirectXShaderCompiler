@@ -14,7 +14,7 @@
 #ifndef LLVM_CLANG_LIB_SPIRV_SPIRVEVALINFO_H
 #define LLVM_CLANG_LIB_SPIRV_SPIRVEVALINFO_H
 
-#include "spirv/1.0/spirv.hpp11"
+#include "spirv/unified1/spirv.hpp11"
 
 namespace clang {
 namespace spirv {
@@ -79,36 +79,52 @@ public:
   /// Handly implicit conversion to test whether the <result-id> is valid.
   operator bool() const { return resultId != 0; }
 
+  inline SpirvEvalInfo &setContainsAliasComponent(bool);
+  bool containsAliasComponent() const { return containsAlias; }
+
   inline SpirvEvalInfo &setStorageClass(spv::StorageClass sc);
   spv::StorageClass getStorageClass() const { return storageClass; }
 
   inline SpirvEvalInfo &setLayoutRule(LayoutRule rule);
   LayoutRule getLayoutRule() const { return layoutRule; }
 
-  inline SpirvEvalInfo &setRValue();
+  inline SpirvEvalInfo &setRValue(bool rvalue = true);
   bool isRValue() const { return isRValue_; }
 
   inline SpirvEvalInfo &setConstant();
   bool isConstant() const { return isConstant_; }
+
+  inline SpirvEvalInfo &setSpecConstant();
+  bool isSpecConstant() const { return isSpecConstant_; }
 
   inline SpirvEvalInfo &setRelaxedPrecision();
   bool isRelaxedPrecision() const { return isRelaxedPrecision_; }
 
 private:
   uint32_t resultId;
+  /// Indicates whether this evaluation result contains alias variables
+  ///
+  /// This field should only be true for stand-alone alias variables, which is
+  /// of pointer-to-pointer type, or struct variables containing alias fields.
+  /// After dereferencing the alias variable, this should be set to false to let
+  /// CodeGen fall back to normal handling path.
+  ///
+  /// Note: legalization specific code
+  bool containsAlias;
 
   spv::StorageClass storageClass;
   LayoutRule layoutRule;
 
   bool isRValue_;
   bool isConstant_;
+  bool isSpecConstant_;
   bool isRelaxedPrecision_;
 };
 
 SpirvEvalInfo::SpirvEvalInfo(uint32_t id)
-    : resultId(id), storageClass(spv::StorageClass::Function),
-      layoutRule(LayoutRule::Void), isRValue_(false), isConstant_(false),
-      isRelaxedPrecision_(false) {}
+    : resultId(id), containsAlias(false),
+      storageClass(spv::StorageClass::Function), layoutRule(LayoutRule::Void),
+      isRValue_(false), isConstant_(false), isRelaxedPrecision_(false) {}
 
 SpirvEvalInfo &SpirvEvalInfo::setResultId(uint32_t id) {
   resultId = id;
@@ -121,6 +137,11 @@ SpirvEvalInfo SpirvEvalInfo::substResultId(uint32_t newId) const {
   return info;
 }
 
+SpirvEvalInfo &SpirvEvalInfo::setContainsAliasComponent(bool contains) {
+  containsAlias = contains;
+  return *this;
+}
+
 SpirvEvalInfo &SpirvEvalInfo::setStorageClass(spv::StorageClass sc) {
   storageClass = sc;
   return *this;
@@ -131,13 +152,19 @@ SpirvEvalInfo &SpirvEvalInfo::setLayoutRule(LayoutRule rule) {
   return *this;
 }
 
-SpirvEvalInfo &SpirvEvalInfo::setRValue() {
-  isRValue_ = true;
+SpirvEvalInfo &SpirvEvalInfo::setRValue(bool rvalue) {
+  isRValue_ = rvalue;
   return *this;
 }
 
 SpirvEvalInfo &SpirvEvalInfo::setConstant() {
   isConstant_ = true;
+  return *this;
+}
+
+SpirvEvalInfo &SpirvEvalInfo::setSpecConstant() {
+  // Specialization constant is also a kind of constant.
+  isConstant_ = isSpecConstant_ = true;
   return *this;
 }
 

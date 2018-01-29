@@ -451,6 +451,7 @@ public:
   TEST_METHOD(PixForceEarlyZ)
   TEST_METHOD(PixDebugBasic)
   TEST_METHOD(PixDebugUAVSize)
+  TEST_METHOD(PixDebugGSParameters)
   TEST_METHOD(PixDebugPSParameters)
   TEST_METHOD(PixDebugVSParameters)
   TEST_METHOD(PixDebugCSParameters)
@@ -458,6 +459,9 @@ public:
   TEST_METHOD(PixDebugPreexistingSVPosition)
   TEST_METHOD(PixDebugPreexistingSVVertex)
   TEST_METHOD(PixDebugPreexistingSVInstance)
+  TEST_METHOD(PixAccessTracking)
+  TEST_METHOD(PixAccessTrackingRTV)
+  TEST_METHOD(PixAccessTrackingStreamOut)
 
   TEST_METHOD(CodeGenAbs1)
   TEST_METHOD(CodeGenAbs2)
@@ -497,6 +501,8 @@ public:
   TEST_METHOD(CodeGenCbufferCopy2)
   TEST_METHOD(CodeGenCbufferCopy3)
   TEST_METHOD(CodeGenCbufferCopy4)
+  TEST_METHOD(CodeGenCbufferWithFunction)
+  TEST_METHOD(CodeGenCbufferWithFunctionCopy)
   TEST_METHOD(CodeGenCbuffer_unused)
   TEST_METHOD(CodeGenCbuffer1_50)
   TEST_METHOD(CodeGenCbuffer1_51)
@@ -1128,6 +1134,7 @@ public:
   TEST_METHOD(ViewID)
   TEST_METHOD(ShaderCompatSuite)
   TEST_METHOD(QuickTest)
+  TEST_METHOD(QuickLlTest)
   BEGIN_TEST_METHOD(SingleFileCheckTest)
     TEST_METHOD_PROPERTY(L"Ignore", L"true")
   END_TEST_METHOD()
@@ -1562,6 +1569,7 @@ public:
       // headers.
       if (!llvm::StringSwitch<bool>(llvm::sys::path::extension(Dir->path()))
                .Cases(".hlsl", ".hlsl", true)
+		       .Cases(".ll", ".ll", true)
                .Default(false))
         continue;
       StringRef filename = Dir->path();
@@ -1864,6 +1872,13 @@ TEST_F(CompilerTest, CompileDebugLines) {
   VERIFY_SUCCEEDED(pSession->findLinesByAddr(0, 0, numExpectedRVAs, &pEnumLineNumbers));
   linesByAddr = ReadLineNumbers(pEnumLineNumbers);
   verifyLines(linesByAddr);
+
+  // Verify findFileById.
+  CComPtr<IDiaSourceFile> pFile;
+  VERIFY_SUCCEEDED(pSession->findFileById(0, &pFile));
+  CComBSTR pName;
+  VERIFY_SUCCEEDED(pFile->get_fileName(&pName));
+  VERIFY_ARE_EQUAL_WSTR(pName, L"source.hlsl");
 }
 
 TEST_F(CompilerTest, CompileWhenDefinesThenApplied) {
@@ -1919,16 +1934,50 @@ TEST_F(CompilerTest, CompileWhenEmptyThenFails) {
   CComPtr<IDxcCompiler> pCompiler;
   CComPtr<IDxcOperationResult> pResult;
   CComPtr<IDxcBlobEncoding> pSource;
+  CComPtr<IDxcBlobEncoding> pSourceBad;
+  LPCWSTR pProfile = L"ps_6_0";
+  LPCWSTR pEntryPoint = L"main";
 
   VERIFY_SUCCEEDED(CreateCompiler(&pCompiler));
   CreateBlobFromText("float4 main() : SV_Target { return 0; }", &pSource);
+  CreateBlobFromText("float4 main() : SV_Target { return undef; }", &pSourceBad);
+
+  // correct version
+  VERIFY_SUCCEEDED(pCompiler->Compile(pSource, L"source.hlsl", pEntryPoint,
+                                      pProfile, nullptr, 0, nullptr, 0, nullptr,
+                                      &pResult));
+  pResult.Release();
+
+  // correct version with compilation errors
+  VERIFY_SUCCEEDED(pCompiler->Compile(pSourceBad, L"source.hlsl", pEntryPoint,
+                                      pProfile, nullptr, 0, nullptr, 0, nullptr,
+                                      &pResult));
+  pResult.Release();
 
   // null source
-  VERIFY_FAILED(pCompiler->Compile(nullptr, L"source.hlsl", nullptr, nullptr,
+  VERIFY_FAILED(pCompiler->Compile(nullptr, L"source.hlsl", pEntryPoint, pProfile,
                                    nullptr, 0, nullptr, 0, nullptr, &pResult));
+
+  // null profile
+  VERIFY_FAILED(pCompiler->Compile(pSourceBad, L"source.hlsl", pEntryPoint,
+                                   nullptr, nullptr, 0, nullptr, 0, nullptr,
+                                   &pResult));
+
+  // null source name succeeds
+  VERIFY_SUCCEEDED(pCompiler->Compile(pSourceBad, nullptr, pEntryPoint, pProfile,
+                                   nullptr, 0, nullptr, 0, nullptr, &pResult));
+  pResult.Release();
+
+  // empty source name (as opposed to null) also suceeds
+  VERIFY_SUCCEEDED(pCompiler->Compile(pSourceBad, L"", pEntryPoint, pProfile,
+                                      nullptr, 0, nullptr, 0, nullptr,
+                                      &pResult));
+  pResult.Release();
+
   // null result
-  VERIFY_FAILED(pCompiler->Compile(pSource, L"source.hlsl", nullptr, nullptr,
-                                   nullptr, 0, nullptr, 0, nullptr, nullptr));
+  VERIFY_FAILED(pCompiler->Compile(pSource, L"source.hlsl", pEntryPoint,
+                                   pProfile, nullptr, 0, nullptr, 0, nullptr,
+                                   nullptr));
 }
 
 TEST_F(CompilerTest, CompileWhenIncorrectThenFails) {
@@ -2974,6 +3023,10 @@ TEST_F(CompilerTest, PixDebugUAVSize) {
   CodeGenTestCheck(L"pix\\DebugUAVSize.hlsl");
 }
 
+TEST_F(CompilerTest, PixDebugGSParameters) {
+  CodeGenTestCheck(L"pix\\DebugGSParameters.hlsl");
+}
+
 TEST_F(CompilerTest, PixDebugPSParameters) {
   CodeGenTestCheck(L"pix\\DebugPSParameters.hlsl");
 }
@@ -3000,6 +3053,18 @@ TEST_F(CompilerTest, PixDebugPreexistingSVVertex) {
 
 TEST_F(CompilerTest, PixDebugPreexistingSVInstance) {
   CodeGenTestCheck(L"pix\\DebugPreexistingSVInstance.hlsl");
+}
+
+TEST_F(CompilerTest, PixAccessTracking) {
+  CodeGenTestCheck(L"pix\\AccessTracking.hlsl");
+}
+
+TEST_F(CompilerTest, PixAccessTrackingRTV) {
+  CodeGenTestCheck(L"pix\\AccessTrackingRTV.hlsl");
+}
+
+TEST_F(CompilerTest, PixAccessTrackingStreamOut) {
+  CodeGenTestCheck(L"pix\\AccessTrackingStreamOut.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenAbs1) {
@@ -3157,6 +3222,14 @@ TEST_F(CompilerTest, CodeGenCbufferCopy3) {
 
 TEST_F(CompilerTest, CodeGenCbufferCopy4) {
   CodeGenTestCheck(L"..\\CodeGenHLSL\\cbuffer_copy4.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenCbufferWithFunction) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\cbuffer_fn.hlsl");
+}
+
+TEST_F(CompilerTest, CodeGenCbufferWithFunctionCopy) {
+  CodeGenTestCheck(L"..\\CodeGenHLSL\\cbuffer_fn_copy.hlsl");
 }
 
 TEST_F(CompilerTest, CodeGenCbuffer_unused) {
@@ -5853,6 +5926,10 @@ TEST_F(CompilerTest, ShaderCompatSuite) {
 
 TEST_F(CompilerTest, QuickTest) {
   CodeGenTestCheckBatchDir(L"..\\CodeGenHLSL\\quick-test");
+}
+
+TEST_F(CompilerTest, QuickLlTest) {
+	CodeGenTestCheckBatchDir(L"..\\CodeGenHLSL\\quick-ll-test");
 }
 
 TEST_F(CompilerTest, SingleFileCheckTest) {

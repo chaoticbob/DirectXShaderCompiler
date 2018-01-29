@@ -34,19 +34,29 @@ inline void roundToPow2(uint32_t *val, uint32_t pow2) {
 }
 } // anonymous namespace
 
-bool TypeTranslator::isRelaxedPrecisionType(QualType type) {
+bool TypeTranslator::isRelaxedPrecisionType(QualType type,
+                                            const EmitSPIRVOptions &opts) {
   // Primitive types
   {
     QualType ty = {};
     if (isScalarType(type, &ty))
       if (const auto *builtinType = ty->getAs<BuiltinType>())
         switch (builtinType->getKind()) {
+        // TODO: Figure out why 'min16float' and 'half' share an enum.
+        // 'half' should not get RelaxedPrecision decoration, but due to the
+        // shared enum, we currently do so.
+        case BuiltinType::Half:
         case BuiltinType::Short:
         case BuiltinType::UShort:
         case BuiltinType::Min12Int:
-        case BuiltinType::Min10Float:
-        case BuiltinType::Half:
-          return true;
+        case BuiltinType::Min10Float: {
+          // If '-enable-16bit-types' options is enabled, these types are
+          // translated to real 16-bit type, and therefore are not
+          // RelaxedPrecision.
+          // If the options is not enabled, these types are translated to 32-bit
+          // types with the added RelaxedPrecision decoration.
+          return !opts.enable16BitTypes;
+        }
         }
   }
 
@@ -55,7 +65,7 @@ bool TypeTranslator::isRelaxedPrecisionType(QualType type) {
   {
     QualType elemType = {};
     if (isVectorType(type, &elemType) || isMxNMatrix(type, &elemType))
-      return isRelaxedPrecisionType(elemType);
+      return isRelaxedPrecisionType(elemType, opts);
   }
 
   return false;
@@ -108,6 +118,91 @@ bool TypeTranslator::isOpaqueStructType(QualType type) {
   return false;
 }
 
+void TypeTranslator::LiteralTypeHint::setHint(QualType ty) {
+  // You can set hint only once for each object.
+  assert(type == QualType());
+  type = ty;
+  translator.pushIntendedLiteralType(type);
+}
+
+TypeTranslator::LiteralTypeHint::LiteralTypeHint(TypeTranslator &t)
+    : translator(t), type({}) {}
+
+TypeTranslator::LiteralTypeHint::LiteralTypeHint(TypeTranslator &t, QualType ty)
+    : translator(t), type(ty) {
+  if (!isLiteralType(type))
+    translator.pushIntendedLiteralType(type);
+}
+
+TypeTranslator::LiteralTypeHint::~LiteralTypeHint() {
+  if (type != QualType() && !isLiteralType(type))
+    translator.popIntendedLiteralType();
+}
+
+bool TypeTranslator::LiteralTypeHint::isLiteralType(QualType type) {
+  if (type->isSpecificBuiltinType(BuiltinType::LitInt) ||
+      type->isSpecificBuiltinType(BuiltinType::LitFloat))
+    return true;
+
+  // For cases such as 'vector<literal int, 2>' or 'vector<literal float, 1>'
+  if (hlsl::IsHLSLVecType(type))
+    return isLiteralType(hlsl::GetHLSLVecElementType(type));
+
+  return false;
+}
+
+void TypeTranslator::pushIntendedLiteralType(QualType type) {
+  QualType elemType = {};
+  if (isVectorType(type, &elemType)) {
+    type = elemType;
+  } else if (isMxNMatrix(type, &elemType)) {
+    type = elemType;
+  }
+  assert(!type->isSpecificBuiltinType(BuiltinType::LitInt) &&
+         !type->isSpecificBuiltinType(BuiltinType::LitFloat));
+  intendedLiteralTypes.push(type);
+}
+
+QualType TypeTranslator::getIntendedLiteralType(QualType type) {
+  if (!intendedLiteralTypes.empty()) {
+    // If the stack is not empty, there is potentially a useful hint about how a
+    // given literal should be translated.
+    //
+    // However, a hint should not be returned blindly. It is possible that casts
+    // are occuring. For Example:
+    //
+    //   TU
+    //    |_ n1: <IntegralToFloating> float
+    //       |_ n2: ConditionalOperator 'literal int'
+    //          |_ n3: cond, bool
+    //          |_ n4: 'literal int' 2
+    //          |_ n5: 'literal int' 3
+    //
+    // When evaluating the return type of ConditionalOperator, we shouldn't
+    // provide 'float' as hint. The cast AST node should take care of that.
+    // In the above example, we have no hints about how '2' or '3' should be
+    // used.
+    QualType potentialHint = intendedLiteralTypes.top();
+    const bool hintIsInteger =
+        potentialHint->isIntegerType() && !potentialHint->isBooleanType();
+    const bool hintIsFloating = potentialHint->isFloatingType();
+    const bool isDifferentBasicType =
+        (type->isSpecificBuiltinType(BuiltinType::LitInt) && !hintIsInteger) ||
+        (type->isSpecificBuiltinType(BuiltinType::LitFloat) && !hintIsFloating);
+
+    if (!isDifferentBasicType)
+      return intendedLiteralTypes.top();
+  }
+
+  // We don't have any useful hints, return the given type itself.
+  return type;
+}
+
+void TypeTranslator::popIntendedLiteralType() {
+  assert(!intendedLiteralTypes.empty());
+  intendedLiteralTypes.pop();
+}
+
 uint32_t TypeTranslator::translateType(QualType type, LayoutRule rule,
                                        bool isRowMajor) {
   // We can only apply row_major to matrices or arrays of matrices.
@@ -122,37 +217,62 @@ uint32_t TypeTranslator::translateType(QualType type, LayoutRule rule,
   // Primitive types
   {
     QualType ty = {};
-    if (isScalarType(type, &ty))
-      if (const auto *builtinType = ty->getAs<BuiltinType>())
+    if (isScalarType(type, &ty)) {
+      if (const auto *builtinType = ty->getAs<BuiltinType>()) {
         switch (builtinType->getKind()) {
         case BuiltinType::Void:
           return theBuilder.getVoidType();
         case BuiltinType::Bool:
           return theBuilder.getBoolType();
-        // int, min16int (short), and min12int are all translated to 32-bit
-        // signed integers in SPIR-V.
         case BuiltinType::Int:
-        case BuiltinType::Short:
-        case BuiltinType::Min12Int:
           return theBuilder.getInt32Type();
-        // uint and min16uint (ushort) are both translated to 32-bit unsigned
-        // integers in SPIR-V.
-        case BuiltinType::UShort:
         case BuiltinType::UInt:
           return theBuilder.getUint32Type();
+        case BuiltinType::Float:
+          return theBuilder.getFloat32Type();
+        case BuiltinType::Double:
+          return theBuilder.getFloat64Type();
         case BuiltinType::LongLong:
           return theBuilder.getInt64Type();
         case BuiltinType::ULongLong:
           return theBuilder.getUint64Type();
-        // float, min16float (half), and min10float are all translated to 32-bit
-        // float in SPIR-V.
-        case BuiltinType::Float:
+        // min16int (short), and min12int are treated as 16-bit Int if
+        // '-enable-16bit-types' option is enabled. They are treated as 32-bit
+        // Int otherwise.
+        case BuiltinType::Short:
+        case BuiltinType::Min12Int: {
+          if (spirvOptions.enable16BitTypes)
+            return theBuilder.getInt16Type();
+          else
+            return theBuilder.getInt32Type();
+        }
+        // min16uint (ushort) is treated as 16-bit Uint if '-enable-16bit-types'
+        // option is enabled. It is treated as 32-bit Uint otherwise.
+        case BuiltinType::UShort: {
+          if (spirvOptions.enable16BitTypes)
+            return theBuilder.getUint16Type();
+          else
+            return theBuilder.getUint32Type();
+        }
+        // min16float (half), and min10float are all translated to
+        // 32-bit float in SPIR-V.
+        // min16float (half), and min10float are treated as 16-bit float if
+        // '-enable-16bit-types' option is enabled. They are treated as 32-bit
+        // float otherwise.
         case BuiltinType::Half:
-        case BuiltinType::Min10Float:
-          return theBuilder.getFloat32Type();
-        case BuiltinType::Double:
-          return theBuilder.getFloat64Type();
+        case BuiltinType::Min10Float: {
+          if (spirvOptions.enable16BitTypes)
+            return theBuilder.getFloat16Type();
+          else
+            return theBuilder.getFloat32Type();
+        }
         case BuiltinType::LitFloat: {
+          // First try to see if there are any hints about how this literal type
+          // is going to be used. If so, use the hint.
+          if (getIntendedLiteralType(ty) != ty) {
+            return translateType(getIntendedLiteralType(ty));
+          }
+
           const auto &semantics = astContext.getFloatTypeSemantics(type);
           const auto bitwidth = llvm::APFloat::getSizeInBits(semantics);
           if (bitwidth <= 32)
@@ -161,6 +281,12 @@ uint32_t TypeTranslator::translateType(QualType type, LayoutRule rule,
             return theBuilder.getFloat64Type();
         }
         case BuiltinType::LitInt: {
+          // First try to see if there are any hints about how this literal type
+          // is going to be used. If so, use the hint.
+          if (getIntendedLiteralType(ty) != ty) {
+            return translateType(getIntendedLiteralType(ty));
+          }
+
           const auto bitwidth = astContext.getIntWidth(type);
           // All integer variants with bitwidth larger than 32 are represented
           // as 64-bit int in SPIR-V.
@@ -178,6 +304,8 @@ uint32_t TypeTranslator::translateType(QualType type, LayoutRule rule,
               << builtinType->getTypeClassName();
           return 0;
         }
+      }
+    }
   }
 
   // Typedefs
@@ -251,8 +379,8 @@ uint32_t TypeTranslator::translateType(QualType type, LayoutRule rule,
     llvm::SmallVector<uint32_t, 4> fieldTypes;
     llvm::SmallVector<llvm::StringRef, 4> fieldNames;
     for (const auto *field : decl->fields()) {
-      fieldTypes.push_back(translateType(field->getType(), rule,
-                                         field->hasAttr<HLSLRowMajorAttr>()));
+      fieldTypes.push_back(translateType(
+          field->getType(), rule, isRowMajorMatrix(field->getType(), field)));
       fieldNames.push_back(field->getName());
     }
 
@@ -377,6 +505,42 @@ bool TypeTranslator::isConsumeStructuredBuffer(QualType type) {
   return name == "ConsumeStructuredBuffer";
 }
 
+bool TypeTranslator::isRWAppendConsumeSBuffer(QualType type) {
+  if (const RecordType *recordType = type->getAs<RecordType>()) {
+    StringRef name = recordType->getDecl()->getName();
+    return name == "RWStructuredBuffer" || name == "AppendStructuredBuffer" ||
+           name == "ConsumeStructuredBuffer";
+  }
+  return false;
+}
+
+bool TypeTranslator::isAKindOfStructuredOrByteBuffer(QualType type) {
+  if (const RecordType *recordType = type->getAs<RecordType>()) {
+    StringRef name = recordType->getDecl()->getName();
+    return name == "StructuredBuffer" || name == "RWStructuredBuffer" ||
+           name == "ByteAddressBuffer" || name == "RWByteAddressBuffer" ||
+           name == "AppendStructuredBuffer" ||
+           name == "ConsumeStructuredBuffer";
+  }
+  return false;
+}
+
+bool TypeTranslator::isOrContainsAKindOfStructuredOrByteBuffer(QualType type) {
+  if (const RecordType *recordType = type->getAs<RecordType>()) {
+    StringRef name = recordType->getDecl()->getName();
+    if (name == "StructuredBuffer" || name == "RWStructuredBuffer" ||
+        name == "ByteAddressBuffer" || name == "RWByteAddressBuffer" ||
+        name == "AppendStructuredBuffer" || name == "ConsumeStructuredBuffer")
+      return true;
+
+    for (const auto *field : recordType->getDecl()->fields()) {
+      if (isOrContainsAKindOfStructuredOrByteBuffer(field->getType()))
+        return true;
+    }
+  }
+  return false;
+}
+
 bool TypeTranslator::isStructuredBuffer(QualType type) {
   const auto *recordType = type->getAs<RecordType>();
   if (!recordType)
@@ -445,6 +609,20 @@ bool TypeTranslator::isSampler(QualType type) {
     if (name == "SamplerState" || name == "SamplerComparisonState")
       return true;
   }
+  return false;
+}
+
+bool TypeTranslator::isSubpassInput(QualType type) {
+  if (const auto *rt = type->getAs<RecordType>())
+    return rt->getDecl()->getName() == "SubpassInput";
+
+  return false;
+}
+
+bool TypeTranslator::isSubpassInputMS(QualType type) {
+  if (const auto *rt = type->getAs<RecordType>())
+    return rt->getDecl()->getName() == "SubpassInputMS";
+
   return false;
 }
 
@@ -560,6 +738,21 @@ bool TypeTranslator::isMxNMatrix(QualType type, QualType *elemType,
   return true;
 }
 
+bool TypeTranslator::isRowMajorMatrix(QualType type, const Decl *decl) const {
+  if (!isMxNMatrix(type) && !type->isArrayType())
+    return false;
+
+  if (const auto *arrayType = astContext.getAsConstantArrayType(type))
+    if (!isMxNMatrix(arrayType->getElementType()))
+      return false;
+
+  if (!decl)
+    return spirvOptions.defaultRowMajor;
+
+  return decl->hasAttr<HLSLRowMajorAttr>() ||
+         !decl->hasAttr<HLSLColumnMajorAttr>() && spirvOptions.defaultRowMajor;
+}
+
 bool TypeTranslator::isSpirvAcceptableMatrixType(QualType type) {
   QualType elemType = {};
   return isMxNMatrix(type, &elemType) && elemType->isFloatingType();
@@ -606,24 +799,24 @@ TypeTranslator::getLayoutDecorations(const DeclContext *decl, LayoutRule rule) {
 
   for (const auto *field : decl->decls()) {
     // Ignore implicit generated struct declarations/constructors/destructors.
-    if (field->isImplicit())
+    // Ignore embedded struct/union/class/enum/function decls.
+    if (field->isImplicit() || isa<TagDecl>(field) || isa<FunctionDecl>(field))
       continue;
 
     // The field can only be FieldDecl (for normal structs) or VarDecl (for
     // HLSLBufferDecls).
     auto fieldType = cast<DeclaratorDecl>(field)->getType();
-    const bool isRowMajor = field->hasAttr<HLSLRowMajorAttr>();
+    const bool isRowMajor = isRowMajorMatrix(fieldType, field);
 
     uint32_t memberAlignment = 0, memberSize = 0, stride = 0;
     std::tie(memberAlignment, memberSize) =
         getAlignmentAndSize(fieldType, rule, isRowMajor, &stride);
 
     // Each structure-type member must have an Offset Decoration.
-    const auto *offsetAttr = field->getAttr<VKOffsetAttr>();
-    if (offsetAttr)
-        offset = offsetAttr->getOffset();
+    if (const auto *offsetAttr = field->getAttr<VKOffsetAttr>())
+      offset = offsetAttr->getOffset();
     else
-        roundToPow2(&offset, memberAlignment);
+      roundToPow2(&offset, memberAlignment);
     decorations.push_back(Decoration::getOffset(*spirvContext, offset, index));
     offset += memberSize;
 
@@ -716,10 +909,20 @@ uint32_t TypeTranslator::translateResourceType(QualType type, LayoutRule rule) {
 
   if (name == "StructuredBuffer" || name == "RWStructuredBuffer" ||
       name == "AppendStructuredBuffer" || name == "ConsumeStructuredBuffer") {
-    auto &context = *theBuilder.getSPIRVContext();
     // StructureBuffer<S> will be translated into an OpTypeStruct with one
     // field, which is an OpTypeRuntimeArray of OpTypeStruct (S).
 
+    // If layout rule is void, it means these resource types are used for
+    // declaring local resources, which should be created as alias variables.
+    // The aliased-to variable should surely be in the Uniform storage class,
+    // which has layout decorations.
+    bool asAlias = false;
+    if (rule == LayoutRule::Void) {
+      asAlias = true;
+      rule = LayoutRule::GLSLStd430;
+    }
+
+    auto &context = *theBuilder.getSPIRVContext();
     const auto s = hlsl::GetHLSLResourceResultType(type);
     const uint32_t structType = translateType(s, rule);
     std::string structName;
@@ -744,16 +947,36 @@ uint32_t TypeTranslator::translateResourceType(QualType type, LayoutRule rule) {
       decorations.push_back(Decoration::getNonWritable(context, 0));
     decorations.push_back(Decoration::getBufferBlock(context));
     const std::string typeName = "type." + name.str() + "." + structName;
-    return theBuilder.getStructType(raType, typeName, {}, decorations);
+    const auto valType =
+        theBuilder.getStructType(raType, typeName, {}, decorations);
+
+    if (asAlias) {
+      // All structured buffers are in the Uniform storage class.
+      return theBuilder.getPointerType(valType, spv::StorageClass::Uniform);
+    } else {
+      return valType;
+    }
   }
 
   // ByteAddressBuffer types.
   if (name == "ByteAddressBuffer") {
-    return theBuilder.getByteAddressBufferType(/*isRW*/ false);
+    const auto bufferType = theBuilder.getByteAddressBufferType(/*isRW*/ false);
+    if (rule == LayoutRule::Void) {
+      // All byte address buffers are in the Uniform storage class.
+      return theBuilder.getPointerType(bufferType, spv::StorageClass::Uniform);
+    } else {
+      return bufferType;
+    }
   }
   // RWByteAddressBuffer types.
   if (name == "RWByteAddressBuffer") {
-    return theBuilder.getByteAddressBufferType(/*isRW*/ true);
+    const auto bufferType = theBuilder.getByteAddressBufferType(/*isRW*/ true);
+    if (rule == LayoutRule::Void) {
+      // All byte address buffers are in the Uniform storage class.
+      return theBuilder.getPointerType(bufferType, spv::StorageClass::Uniform);
+    } else {
+      return bufferType;
+    }
   }
 
   // Buffer and RWBuffer types
@@ -787,6 +1010,14 @@ uint32_t TypeTranslator::translateResourceType(QualType type, LayoutRule rule) {
   if (name == "TriangleStream" || name == "LineStream" ||
       name == "PointStream") {
     return translateType(hlsl::GetHLSLResourceResultType(type), rule);
+  }
+
+  if (name == "SubpassInput" || name == "SubpassInputMS") {
+    const auto sampledType = hlsl::GetHLSLResourceResultType(type);
+    return theBuilder.getImageType(
+        translateType(getElementType(sampledType)), spv::Dim::SubpassData,
+        /*depth*/ 0, /*isArray*/ false, /*ms*/ name == "SubpassInputMS",
+        /*sampled*/ 2);
   }
 
   return 0;
@@ -945,8 +1176,9 @@ TypeTranslator::getAlignmentAndSize(QualType type, LayoutRule rule,
 
     for (const auto *field : structType->getDecl()->fields()) {
       uint32_t memberAlignment = 0, memberSize = 0;
-      std::tie(memberAlignment, memberSize) = getAlignmentAndSize(
-          field->getType(), rule, field->hasAttr<HLSLRowMajorAttr>(), stride);
+      const bool isRowMajor = isRowMajorMatrix(field->getType(), field);
+      std::tie(memberAlignment, memberSize) =
+          getAlignmentAndSize(field->getType(), rule, isRowMajor, stride);
 
       // The base alignment of the structure is N, where N is the largest
       // base alignment value of any of its members...

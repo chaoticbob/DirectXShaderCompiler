@@ -108,6 +108,80 @@ std::string StageVar::getSemanticStr() const {
   return ss.str();
 }
 
+uint32_t CounterIdAliasPair::get(ModuleBuilder &builder,
+                                 TypeTranslator &translator) const {
+  if (isAlias) {
+    const uint32_t counterVarType = builder.getPointerType(
+        translator.getACSBufferCounter(), spv::StorageClass::Uniform);
+    return builder.createLoad(counterVarType, resultId);
+  }
+  return resultId;
+}
+
+const CounterIdAliasPair *
+CounterVarFields::get(const llvm::SmallVectorImpl<uint32_t> &indices) const {
+  for (const auto &field : fields)
+    if (field.indices == indices)
+      return &field.counterVar;
+  return nullptr;
+}
+
+bool CounterVarFields::assign(const CounterVarFields &srcFields,
+                              ModuleBuilder &builder,
+                              TypeTranslator &translator) const {
+  for (const auto &field : fields) {
+    const auto *srcField = srcFields.get(field.indices);
+    if (!srcField)
+      return false;
+
+    field.counterVar.assign(*srcField, builder, translator);
+  }
+
+  return true;
+}
+
+bool CounterVarFields::assign(const CounterVarFields &srcFields,
+                              const llvm::SmallVector<uint32_t, 4> &dstPrefix,
+                              const llvm::SmallVector<uint32_t, 4> &srcPrefix,
+                              ModuleBuilder &builder,
+                              TypeTranslator &translator) const {
+  if (dstPrefix.empty() && srcPrefix.empty())
+    return assign(srcFields, builder, translator);
+
+  llvm::SmallVector<uint32_t, 4> srcIndices = srcPrefix;
+
+  // If whole has the given prefix, appends all elements after the prefix in
+  // whole to srcIndices.
+  const auto applyDiff =
+      [&srcIndices](const llvm::SmallVector<uint32_t, 4> &whole,
+                    const llvm::SmallVector<uint32_t, 4> &prefix) -> bool {
+    uint32_t i = 0;
+    for (; i < prefix.size(); ++i)
+      if (whole[i] != prefix[i]) {
+        break;
+      }
+    if (i == prefix.size()) {
+      for (; i < whole.size(); ++i)
+        srcIndices.push_back(whole[i]);
+      return true;
+    }
+    return false;
+  };
+
+  for (const auto &field : fields)
+    if (applyDiff(field.indices, dstPrefix)) {
+      const auto *srcField = srcFields.get(srcIndices);
+      if (!srcField)
+        return false;
+
+      field.counterVar.assign(*srcField, builder, translator);
+      for (uint32_t i = srcPrefix.size(); i < srcIndices.size(); ++i)
+        srcIndices.pop_back();
+    }
+
+  return true;
+}
+
 DeclResultIdMapper::SemanticInfo
 DeclResultIdMapper::getStageVarSemantic(const ValueDecl *decl) {
   for (auto *annotation : decl->getUnusualAnnotations()) {
@@ -209,7 +283,7 @@ DeclResultIdMapper::getDeclSpirvInfo(const ValueDecl *decl) const {
   return nullptr;
 }
 
-SpirvEvalInfo DeclResultIdMapper::getDeclResultId(const ValueDecl *decl,
+SpirvEvalInfo DeclResultIdMapper::getDeclEvalInfo(const ValueDecl *decl,
                                                   bool checkRegistered) {
   if (const auto *info = getDeclSpirvInfo(decl))
     if (info->indexInCTBuffer >= 0) {
@@ -222,7 +296,7 @@ SpirvEvalInfo DeclResultIdMapper::getDeclResultId(const ValueDecl *decl,
           cast<VarDecl>(decl)->getType(),
           // We need to set decorateLayout here to avoid creating SPIR-V
           // instructions for the current type without decorations.
-          info->info.getLayoutRule());
+          info->info.getLayoutRule(), info->isRowMajor);
 
       const uint32_t elemId = theBuilder.createAccessChain(
           theBuilder.getPointerType(varType, info->info.getStorageClass()),
@@ -238,36 +312,62 @@ SpirvEvalInfo DeclResultIdMapper::getDeclResultId(const ValueDecl *decl,
   if (checkRegistered) {
     emitFatalError("found unregistered decl", decl->getLocation())
         << decl->getName();
+    emitNote("please file a bug report on "
+             "https://github.com/Microsoft/DirectXShaderCompiler/issues with "
+             "source code if possible",
+             {});
   }
 
   return 0;
 }
 
 uint32_t DeclResultIdMapper::createFnParam(const ParmVarDecl *param) {
-  const uint32_t type = typeTranslator.translateType(param->getType());
+  bool isAlias = false;
+  auto &info = astDecls[param].info;
+  const uint32_t type =
+      getTypeAndCreateCounterForPotentialAliasVar(param, &isAlias, &info);
   const uint32_t ptrType =
       theBuilder.getPointerType(type, spv::StorageClass::Function);
   const uint32_t id = theBuilder.addFnParam(ptrType, param->getName());
-  astDecls[param] = SpirvEvalInfo(id);
+  info.setResultId(id);
 
   return id;
 }
 
+void DeclResultIdMapper::createCounterVarForDecl(const DeclaratorDecl *decl) {
+  const QualType declType = getTypeOrFnRetType(decl);
+
+  if (!counterVars.count(decl) &&
+      TypeTranslator::isRWAppendConsumeSBuffer(declType)) {
+    createCounterVar(decl, /*isAlias=*/true);
+  } else if (!fieldCounterVars.count(decl) && declType->isStructureType() &&
+             // Exclude other resource types which are represented as structs
+             !hlsl::IsHLSLResourceType(declType)) {
+    createFieldCounterVars(decl);
+  }
+}
+
 uint32_t DeclResultIdMapper::createFnVar(const VarDecl *var,
                                          llvm::Optional<uint32_t> init) {
-  const uint32_t type = typeTranslator.translateType(var->getType());
+  bool isAlias = false;
+  auto &info = astDecls[var].info;
+  const uint32_t type =
+      getTypeAndCreateCounterForPotentialAliasVar(var, &isAlias, &info);
   const uint32_t id = theBuilder.addFnVar(type, var->getName(), init);
-  astDecls[var] = SpirvEvalInfo(id);
+  info.setResultId(id);
 
   return id;
 }
 
 uint32_t DeclResultIdMapper::createFileVar(const VarDecl *var,
                                            llvm::Optional<uint32_t> init) {
-  const uint32_t type = typeTranslator.translateType(var->getType());
+  bool isAlias = false;
+  auto &info = astDecls[var].info;
+  const uint32_t type =
+      getTypeAndCreateCounterForPotentialAliasVar(var, &isAlias, &info);
   const uint32_t id = theBuilder.addModuleVar(type, spv::StorageClass::Private,
                                               var->getName(), init);
-  astDecls[var] = SpirvEvalInfo(id).setStorageClass(spv::StorageClass::Private);
+  info.setResultId(id).setStorageClass(spv::StorageClass::Private);
 
   return id;
 }
@@ -312,10 +412,13 @@ uint32_t DeclResultIdMapper::createExternVar(const VarDecl *var) {
   resourceVars.emplace_back(id, getResourceCategory(var->getType()), regAttr,
                             bindingAttr, counterBindingAttr);
 
+  if (const auto *inputAttachment = var->getAttr<VKInputAttachmentIndexAttr>())
+    theBuilder.decorateInputAttachmentIndex(id, inputAttachment->getIndex());
+
   if (isACRWSBuffer) {
     // For {Append|Consume|RW}StructuredBuffer, we need to always create another
     // variable for its associated counter.
-    createCounterVar(var);
+    createCounterVar(var, /*isAlias=*/false);
   }
 
   return id;
@@ -349,7 +452,9 @@ uint32_t DeclResultIdMapper::createVarOfExplicitLayoutStruct(
   uint32_t fieldIndex = 0;
   for (const auto *subDecl : decl->decls()) {
     // Ignore implicit generated struct declarations/constructors/destructors.
-    if (subDecl->isImplicit())
+    // Ignore embedded struct/union/class/enum/function decls.
+    if (subDecl->isImplicit() || isa<TagDecl>(subDecl) ||
+        isa<FunctionDecl>(subDecl))
       continue;
 
     // The field can only be FieldDecl (for normal structs) or VarDecl (for
@@ -361,8 +466,9 @@ uint32_t DeclResultIdMapper::createVarOfExplicitLayoutStruct(
     auto varType = declDecl->getType();
     varType.removeLocalConst();
 
-    fieldTypes.push_back(typeTranslator.translateType(
-        varType, layoutRule, declDecl->hasAttr<HLSLRowMajorAttr>()));
+    const bool isRowMajor = typeTranslator.isRowMajorMatrix(varType, declDecl);
+    fieldTypes.push_back(
+        typeTranslator.translateType(varType, layoutRule, isRowMajor));
     fieldNames.push_back(declDecl->getName());
 
     // tbuffer/TextureBuffers are non-writable SSBOs. OpMemberDecorate
@@ -403,13 +509,21 @@ uint32_t DeclResultIdMapper::createCTBuffer(const HLSLBufferDecl *decl) {
   // OpAccessChain.
   int index = 0;
   for (const auto *subDecl : decl->decls()) {
+    // Ignore implicit generated struct declarations/constructors/destructors.
+    // Ignore embedded struct/union/class/enum/function decls.
+    if (subDecl->isImplicit() || isa<TagDecl>(subDecl) ||
+        isa<FunctionDecl>(subDecl))
+      continue;
+
     const auto *varDecl = cast<VarDecl>(subDecl);
+    const bool isRowMajor =
+        typeTranslator.isRowMajorMatrix(varDecl->getType(), varDecl);
     astDecls[varDecl] = {SpirvEvalInfo(bufferVar)
                              .setStorageClass(spv::StorageClass::Uniform)
                              .setLayoutRule(decl->isCBuffer()
                                                 ? LayoutRule::GLSLStd140
                                                 : LayoutRule::GLSLStd430),
-                         index++};
+                         index++, isRowMajor};
   }
   resourceVars.emplace_back(
       bufferVar, ResourceVar::Category::Other, getResourceBinding(decl),
@@ -469,31 +583,122 @@ uint32_t DeclResultIdMapper::getOrRegisterFnResultId(const FunctionDecl *fn) {
   if (const auto *info = getDeclSpirvInfo(fn))
     return info->info;
 
+  auto &info = astDecls[fn].info;
+
+  bool isAlias = false;
+  const uint32_t type =
+      getTypeAndCreateCounterForPotentialAliasVar(fn, &isAlias, &info);
+
   const uint32_t id = theBuilder.getSPIRVContext()->takeNextId();
-  astDecls[fn] = SpirvEvalInfo(id);
+  info.setResultId(id);
+  // No need to dereference to get the pointer. Function returns that are
+  // stand-alone aliases are already pointers to values. All other cases should
+  // be normal rvalues.
+  if (!isAlias ||
+      !TypeTranslator::isAKindOfStructuredOrByteBuffer(fn->getReturnType()))
+    info.setRValue();
 
   return id;
 }
 
-uint32_t DeclResultIdMapper::getOrCreateCounterId(const ValueDecl *decl) {
-  const auto counter = counterVars.find(decl);
-  if (counter != counterVars.end())
-    return counter->second;
-  return createCounterVar(decl);
+const CounterIdAliasPair *DeclResultIdMapper::getCounterIdAliasPair(
+    const DeclaratorDecl *decl, const llvm::SmallVector<uint32_t, 4> *indices) {
+  if (!decl)
+    return nullptr;
+
+  if (indices) {
+    // Indices are provided. Walk through the fields of the decl.
+    const auto counter = fieldCounterVars.find(decl);
+    if (counter != fieldCounterVars.end())
+      return counter->second.get(*indices);
+  } else {
+    // No indices. Check the stand-alone entities.
+    const auto counter = counterVars.find(decl);
+    if (counter != counterVars.end())
+      return &counter->second;
+  }
+
+  return nullptr;
 }
 
-uint32_t DeclResultIdMapper::createCounterVar(const ValueDecl *decl) {
-  const auto *info = getDeclSpirvInfo(decl);
-  const uint32_t counterType = typeTranslator.getACSBufferCounter();
-  const std::string counterName = "counter.var." + decl->getName().str();
-  const uint32_t counterId = theBuilder.addModuleVar(
-      counterType, info->info.getStorageClass(), counterName);
+const CounterVarFields *
+DeclResultIdMapper::getCounterVarFields(const DeclaratorDecl *decl) {
+  if (!decl)
+    return nullptr;
 
-  resourceVars.emplace_back(counterId, ResourceVar::Category::Other,
-                            getResourceBinding(decl),
-                            decl->getAttr<VKBindingAttr>(),
-                            decl->getAttr<VKCounterBindingAttr>(), true);
-  return counterVars[decl] = counterId;
+  const auto found = fieldCounterVars.find(decl);
+  if (found != fieldCounterVars.end())
+    return &found->second;
+
+  return nullptr;
+}
+
+void DeclResultIdMapper::registerSpecConstant(const VarDecl *decl,
+                                              uint32_t specConstant) {
+  astDecls[decl].info.setResultId(specConstant).setRValue().setSpecConstant();
+}
+
+void DeclResultIdMapper::createCounterVar(
+    const DeclaratorDecl *decl, bool isAlias,
+    const llvm::SmallVector<uint32_t, 4> *indices) {
+  std::string counterName = "counter.var." + decl->getName().str();
+  if (indices) {
+    // Append field indices to the name
+    for (const auto index : *indices)
+      counterName += "." + std::to_string(index);
+  }
+
+  uint32_t counterType = typeTranslator.getACSBufferCounter();
+  // {RW|Append|Consume}StructuredBuffer are all in Uniform storage class.
+  // Alias counter variables should be created into the Private storage class.
+  const spv::StorageClass sc =
+      isAlias ? spv::StorageClass::Private : spv::StorageClass::Uniform;
+
+  if (isAlias) {
+    // Apply an extra level of pointer for alias counter variable
+    counterType =
+        theBuilder.getPointerType(counterType, spv::StorageClass::Uniform);
+  }
+
+  const uint32_t counterId =
+      theBuilder.addModuleVar(counterType, sc, counterName);
+
+  if (!isAlias) {
+    // Non-alias counter variables should be put in to resourceVars so that
+    // descriptors can be allocated for them.
+    resourceVars.emplace_back(counterId, ResourceVar::Category::Other,
+                              getResourceBinding(decl),
+                              decl->getAttr<VKBindingAttr>(),
+                              decl->getAttr<VKCounterBindingAttr>(), true);
+  }
+
+  if (indices)
+    fieldCounterVars[decl].append(*indices, counterId);
+  else
+    counterVars[decl] = {counterId, isAlias};
+}
+
+void DeclResultIdMapper::createFieldCounterVars(
+    const DeclaratorDecl *rootDecl, const DeclaratorDecl *decl,
+    llvm::SmallVector<uint32_t, 4> *indices) {
+  const QualType type = getTypeOrFnRetType(decl);
+  const auto *recordType = type->getAs<RecordType>();
+  assert(recordType);
+  const auto *recordDecl = recordType->getDecl();
+
+  for (const auto *field : recordDecl->fields()) {
+    indices->push_back(field->getFieldIndex()); // Build up the index chain
+
+    const QualType fieldType = field->getType();
+    if (TypeTranslator::isRWAppendConsumeSBuffer(fieldType))
+      createCounterVar(rootDecl, /*isAlias=*/true, indices);
+    else if (fieldType->isStructureType() &&
+             !hlsl::IsHLSLResourceType(fieldType))
+      // Go recursively into all nested structs
+      createFieldCounterVars(rootDecl, field, indices);
+
+    indices->pop_back();
+  }
 }
 
 uint32_t
@@ -681,7 +886,7 @@ bool DeclResultIdMapper::finalizeStageIOLocations(bool forInput) {
         // We have checked that not all of the stage variables have explicit
         // location assignment.
         emitError("partial explicit stage %select{output|input}0 location "
-                  "assignment via [[vk::location(X)]] unsupported",
+                  "assignment via vk::location(X) unsupported",
                   {})
             << forInput;
         return false;
@@ -1050,9 +1255,14 @@ bool DeclResultIdMapper::createStageVars(
       // HLSL. If SV_InsideTessFactor is a scalar, only extract index 0 of
       // TessLevelInner.
       else if (semanticKind == hlsl::Semantic::Kind::InsideTessFactor &&
-               !type->isArrayType()) {
-        *value = theBuilder.createCompositeExtract(theBuilder.getFloat32Type(),
-                                                   *value, {0});
+               // Some developers use float[1] instead of a scalar float.
+               (!type->isArrayType() || hlsl::GetArraySize(type) == 1)) {
+        const auto f32Type = theBuilder.getFloat32Type();
+        *value = theBuilder.createCompositeExtract(f32Type, *value, {0});
+        if (type->isArrayType()) // float[1]
+          *value = theBuilder.createCompositeConstruct(
+              theBuilder.getArrayType(f32Type, theBuilder.getConstantUint32(1)),
+              {*value});
       }
       // SV_DomainLocation can refer to a float2 or a float3, whereas TessCoord
       // is always a float3. To ensure SPIR-V validity, a float3 stage variable
@@ -1114,11 +1324,14 @@ bool DeclResultIdMapper::createStageVars(
       // HLSL. If SV_InsideTessFactor is a scalar, only write to index 0 of
       // TessLevelInner.
       else if (semanticKind == hlsl::Semantic::Kind::InsideTessFactor &&
-               !type->isArrayType()) {
+               // Some developers use float[1] instead of a scalar float.
+               (!type->isArrayType() || hlsl::GetArraySize(type) == 1)) {
+        const auto f32Type = theBuilder.getFloat32Type();
         ptr = theBuilder.createAccessChain(
-            theBuilder.getPointerType(theBuilder.getFloat32Type(),
-                                      spv::StorageClass::Output),
+            theBuilder.getPointerType(f32Type, spv::StorageClass::Output),
             varId, theBuilder.getConstantUint32(0));
+        if (type->isArrayType()) // float[1]
+          *value = theBuilder.createCompositeExtract(f32Type, *value, {0});
         theBuilder.createStore(ptr, *value);
       }
       // Special handling of SV_Coverage, which is an unit value. We need to
@@ -1269,6 +1482,18 @@ bool DeclResultIdMapper::writeBackOutputStream(const ValueDecl *decl,
 
     // We should have recorded its stage output variable previously.
     assert(found != stageVarIds.end());
+
+    // Negate SV_Position.y if requested
+    if (spirvOptions.invertY &&
+        semanticInfo.semantic->GetKind() == hlsl::Semantic::Kind::Position) {
+
+      const auto f32Type = theBuilder.getFloat32Type();
+      const auto v4f32Type = theBuilder.getVecType(f32Type, 4);
+      const auto oldY = theBuilder.createCompositeExtract(f32Type, value, {1});
+      const auto newY =
+          theBuilder.createUnaryOp(spv::Op::OpFNegate, f32Type, oldY);
+      value = theBuilder.createCompositeInsert(v4f32Type, value, {1}, newY);
+    }
 
     theBuilder.createStore(found->second, value);
     return true;
@@ -1790,6 +2015,41 @@ DeclResultIdMapper::getStorageClassForSigPoint(const hlsl::SigPoint *sigPoint) {
     llvm_unreachable("Found invalid SigPoint kind for semantic");
   }
   return sc;
+}
+
+uint32_t DeclResultIdMapper::getTypeAndCreateCounterForPotentialAliasVar(
+    const DeclaratorDecl *decl, bool *shouldBeAlias, SpirvEvalInfo *info) {
+  if (const auto *varDecl = dyn_cast<VarDecl>(decl)) {
+    // This method is only intended to be used to create SPIR-V variables in the
+    // Function or Private storage class.
+    assert(!varDecl->isExternallyVisible() || varDecl->isStaticDataMember());
+  }
+
+  const QualType type = getTypeOrFnRetType(decl);
+  // Whether we should generate this decl as an alias variable.
+  bool genAlias = false;
+
+  if (const auto *buffer = dyn_cast<HLSLBufferDecl>(decl->getDeclContext())) {
+    // For ConstantBuffer and TextureBuffer
+    if (buffer->isConstantBufferView())
+      genAlias = true;
+  } else if (TypeTranslator::isOrContainsAKindOfStructuredOrByteBuffer(type)) {
+    genAlias = true;
+  }
+
+  if (shouldBeAlias)
+    *shouldBeAlias = genAlias;
+
+  if (genAlias) {
+    needsLegalization = true;
+
+    createCounterVarForDecl(decl);
+
+    if (info)
+      info->setContainsAliasComponent(true);
+  }
+
+  return typeTranslator.translateType(type);
 }
 
 } // end namespace spirv

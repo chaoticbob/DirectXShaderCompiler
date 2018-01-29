@@ -1319,6 +1319,9 @@ class db_dxil(object):
             {'n':'constant-alpha','t':'float','c':1}])
         add_pass('hlsl-dxil-remove-discards', 'DxilRemoveDiscards', 'HLSL DXIL Remove all discard instructions', [])
         add_pass('hlsl-dxil-force-early-z', 'DxilForceEarlyZ', 'HLSL DXIL Force the early Z global flag, if shader has no discard calls', [])
+        add_pass('hlsl-dxil-pix-shader-access-instrumentation', 'DxilShaderAccessTracking', 'HLSL DXIL shader access tracking for PIX', [
+            {'n':'config','t':'int','c':1},
+            {'n':'checkForDynamicIndexing','t':'bool','c':1}])
         add_pass('hlsl-dxil-debug-instrumentation', 'DxilDebugInstrumentation', 'HLSL DXIL debug instrumentation for PIX', [
             {'n':'UAVSize','t':'int','c':1},
             {'n':'parameter0','t':'int','c':1},
@@ -1779,7 +1782,7 @@ class db_dxil(object):
         self.add_valrule_msg("Sm.ResourceRangeOverlap", "Resource ranges must not overlap", "Resource %0 with base %1 size %2 overlap with other resource with base %3 size %4 in space %5")
         self.add_valrule_msg("Sm.CBufferOffsetOverlap", "CBuffer offsets must not overlap", "CBuffer %0 has offset overlaps at %1")
         self.add_valrule_msg("Sm.CBufferElementOverflow", "CBuffer elements must not overflow", "CBuffer %0 size insufficient for element at offset %1")
-        self.add_valrule_msg("Sm.OpcodeInInvalidFunction", "Invalid DXIL opcode usage like StorePatchConstant in patch constant function", "opcode '%0' should only used in '%1'")
+        self.add_valrule_msg("Sm.OpcodeInInvalidFunction", "Invalid DXIL opcode usage like StorePatchConstant in patch constant function", "opcode '%0' should only be used in '%1'")
         self.add_valrule_msg("Sm.ViewIDNeedsSlot", "ViewID requires compatible space in pixel shader input signature", "Pixel shader input signature lacks available space for ViewID")
 
         # fxc relaxed check of gradient check.
@@ -1901,6 +1904,7 @@ class db_hlsl_intrinsic(object):
             self.unsigned_op = "%s_%s" % (id_prefix, unsigned_op)
         self.overload_param_index = overload_idx        # Parameter determines the overload type, -1 means ret type
         self.key = ("%3d" % ns_idx) + "!" + name + "!" + ("%2d" % len(params)) + "!" + ("%3d" % idx)    # Unique key
+        self.vulkanSpecific = ns.startswith("Vk")       # Vulkan specific intrinsic - SPIRV change
 
 class db_hlsl_namespace(object):
     "A grouping of HLSL intrinsics"

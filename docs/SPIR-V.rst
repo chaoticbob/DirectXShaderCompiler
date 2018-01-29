@@ -166,6 +166,44 @@ Descriptors
 To specify which Vulkan descriptor a particular resource binds to, use the
 ``[[vk::binding(X[, Y])]]`` attribute.
 
+Subpass inputs
+~~~~~~~~~~~~~~
+
+Within a Vulkan `rendering pass <https://www.khronos.org/registry/vulkan/specs/1.0/html/vkspec.html#renderpass>`_,
+a subpass can write results to an output target that can then be read by the
+next subpass as an input subpass. The "Subpass Input" feature regards the
+ability to read an output target.
+
+Subpasses are read through two new builtin resource types, available only in
+pixel shader:
+
+.. code:: hlsl
+
+  class SubpassInput<T> {
+    T SubpassLoad();
+  };
+
+  class SubpassInputMS<T> {
+    T SubpassLoad(int sampleIndex);
+  };
+
+In the above, ``T`` is a scalar or vector type. If omitted, it will defaults to
+``float4``.
+
+Subpass inputs are implicitly addressed by the pixel's (x, y, layer) coordinate.
+These objects support reading the subpass input through the methods as shown
+in the above.
+
+A subpass input is selected by using a new attribute ``vk::input_attachment_index``.
+For example:
+
+.. code:: hlsl
+
+  [[vk::input_attachment_index(i)]] SubpassInput input;
+
+An ``vk::input_attachment_index`` of ``i`` selects the ith entry in the input
+pass list. (See Vulkan API spec for more information.)
+
 Push constants
 ~~~~~~~~~~~~~~
 
@@ -175,6 +213,18 @@ annotated with the ``[[vk::push_constant]]`` attribute.
 
 Please note as per the requirements of Vulkan, "there must be no more than one
 push constant block statically used per shader entry point."
+
+Specialization constants
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+To use Vulkan specialization constants, annotate global constants with the
+``[[vk::constant_id(X)]]`` attribute. For example,
+
+.. code:: hlsl
+
+  [[vk::constant_id(1)]] const bool  specConstBool  = true;
+  [[vk::constant_id(2)]] const int   specConstInt   = 42;
+  [[vk::constant_id(3)]] const float specConstFloat = 1.5;
 
 Builtin variables
 ~~~~~~~~~~~~~~~~~
@@ -209,6 +259,11 @@ The namespace ``vk`` will be used for all Vulkan attributes:
 - ``push_constant``: For marking a variable as the push constant block. Allowed
   on global variables of struct type. At most one variable can be marked as
   ``push_constant`` in a shader.
+- ``constant_id``: For marking a global constant as a specialization constant.
+  Allowed on global variables of boolean/integer/float types.
+- ``input_attachment_index(X)``: To associate the Xth entry in the input pass
+  list to the annotated object. Only allowed on objects whose type are
+  ``SubpassInput`` or ``SubpassInputMS``.
 - ``builtin("X")``: For specifying an entity should be translated into a certain
   Vulkan builtin variable. Allowed on function parameters, function returns,
   and struct fields.
@@ -243,24 +298,26 @@ Normal scalar types
 in HLSL are relatively easy to handle and can be mapped directly to SPIR-V
 type instructions:
 
-================== ================== =========== ====================
-      HLSL               SPIR-V       Capability       Decoration
-================== ================== =========== ====================
-``bool``           ``OpTypeBool``
-``int``            ``OpTypeInt 32 1``
-``uint``/``dword`` ``OpTypeInt 32 0``
-``half``           ``OpTypeFloat 32``             ``RelexedPrecision``
-``float``          ``OpTypeFloat 32``
-``snorm float``    ``OpTypeFloat 32``
-``unorm float``    ``OpTypeFloat 32``
-``double``         ``OpTypeFloat 64`` ``Float64``
-================== ================== =========== ====================
+============================== ======================= ================== =========== =================================
+      HLSL                      Command Line Option           SPIR-V       Capability       Extension
+============================== ======================= ================== =========== =================================
+``bool``                                               ``OpTypeBool``
+``int``/``int32_t``                                    ``OpTypeInt 32 1``
+``int16_t``                    ``-enable-16bit-types`` ``OpTypeInt 16 1`` ``Int16``
+``uint``/``dword``/``uin32_t``                         ``OpTypeInt 32 0``
+``uint16_t``                   ``-enable-16bit-types`` ``OpTypeInt 16 0`` ``Int16``
+``half``                                               ``OpTypeFloat 32``
+``half``/``float16_t``         ``-enable-16bit-types`` ``OpTypeFloat 16`` ``Float16`` ``SPV_AMD_gpu_shader_half_float``
+``float``/``float32_t``                                ``OpTypeFloat 32``
+``snorm float``                                        ``OpTypeFloat 32``
+``unorm float``                                        ``OpTypeFloat 32``
+``double``/``float64_t``                               ``OpTypeFloat 64`` ``Float64``
+============================== ======================= ================== =========== =================================
 
 Please note that ``half`` is translated into 32-bit floating point numbers
 right now because MSDN says that "this data type is provided only for language
 compatibility. Direct3D 10 shader targets map all ``half`` data types to
-``float`` data types." This may change in the future to map to 16-bit floating
-point numbers (possibly via a command-line option).
+``float`` data types."
 
 Minimal precision scalar types
 ------------------------------
@@ -270,17 +327,25 @@ HLSL also supports various
 which graphics drivers can implement by using any precision greater than or
 equal to their specified bit precision.
 There are no direct mappings in SPIR-V for these types. We translate them into
-the corresponding 32-bit scalar types with the ``RelexedPrecision`` decoration:
+the corresponding 16-bit or 32-bit scalar types with the ``RelaxedPrecision`` decoration.
+We use the 16-bit variants if '-enable-16bit-types' command line option is present.
+For more information on these types, please refer to:
+https://github.com/Microsoft/DirectXShaderCompiler/wiki/16-Bit-Scalar-Types
 
-============== ================== ====================
-    HLSL            SPIR-V            Decoration
-============== ================== ====================
-``min16float`` ``OpTypeFloat 32`` ``RelexedPrecision``
-``min10float`` ``OpTypeFloat 32`` ``RelexedPrecision``
-``min16int``   ``OpTypeInt 32 1`` ``RelexedPrecision``
-``min12int``   ``OpTypeInt 32 1`` ``RelexedPrecision``
-``min16uint``  ``OpTypeInt 32 0`` ``RelexedPrecision``
-============== ================== ====================
+============== ======================= ================== ==================== ============ =================================
+    HLSL        Command Line Option          SPIR-V            Decoration       Capability        Extension
+============== ======================= ================== ==================== ============ =================================
+``min16float``                         ``OpTypeFloat 32`` ``RelaxedPrecision``
+``min10float``                         ``OpTypeFloat 32`` ``RelaxedPrecision``
+``min16int``                           ``OpTypeInt 32 1`` ``RelaxedPrecision``
+``min12int``                           ``OpTypeInt 32 1`` ``RelaxedPrecision``
+``min16uint``                          ``OpTypeInt 32 0`` ``RelaxedPrecision``
+``min16float`` ``-enable-16bit-types`` ``OpTypeFloat 16``                      ``Float16``  ``SPV_AMD_gpu_shader_half_float``
+``min10float`` ``-enable-16bit-types`` ``OpTypeFloat 16``                      ``Float16``  ``SPV_AMD_gpu_shader_half_float``
+``min16int``   ``-enable-16bit-types`` ``OpTypeInt 16 1``                      ``Int16``
+``min12int``   ``-enable-16bit-types`` ``OpTypeInt 16 1``                      ``Int16``
+``min16uint``  ``-enable-16bit-types`` ``OpTypeInt 16 0``                      ``Int16``
+============== ======================= ================== ==================== ============ =================================
 
 Vectors and matrices
 --------------------
@@ -2033,6 +2098,52 @@ the instruction directly.
 Since Texture2DMS is represented as ``OpTypeImage`` with ``MS`` of ``1``, the ``OpImageQuerySize`` instruction
 is used to get the width and the height. Furthermore, ``OpImageQuerySamples`` is used to get the numSamples.
 
+``.GetSamplePosition(index)``
++++++++++++++++++++++++++++++
+There are no direct mapping SPIR-V instructions for this method. Right now, it
+is translated into the SPIR-V code for the following HLSL source code:
+
+.. code:: hlsl
+
+  // count is the number of samples in the Texture2DMS(Array)
+  // index is the index of the sample we are trying to get the position
+
+  static const float2 pos2[] = {
+      { 4.0/16.0,  4.0/16.0 }, {-4.0/16.0, -4.0/16.0 },
+  };
+
+  static const float2 pos4[] = {
+      {-2.0/16.0, -6.0/16.0 }, { 6.0/16.0, -2.0/16.0 }, {-6.0/16.0,  2.0/16.0 }, { 2.0/16.0,  6.0/16.0 },
+  };
+
+  static const float2 pos8[] = {
+      { 1.0/16.0, -3.0/16.0 }, {-1.0/16.0,  3.0/16.0 }, { 5.0/16.0,  1.0/16.0 }, {-3.0/16.0, -5.0/16.0 },
+      {-5.0/16.0,  5.0/16.0 }, {-7.0/16.0, -1.0/16.0 }, { 3.0/16.0,  7.0/16.0 }, { 7.0/16.0, -7.0/16.0 },
+  };
+
+  static const float2 pos16[] = {
+      { 1.0/16.0,  1.0/16.0 }, {-1.0/16.0, -3.0/16.0 }, {-3.0/16.0,  2.0/16.0 }, { 4.0/16.0, -1.0/16.0 },
+      {-5.0/16.0, -2.0/16.0 }, { 2.0/16.0,  5.0/16.0 }, { 5.0/16.0,  3.0/16.0 }, { 3.0/16.0, -5.0/16.0 },
+      {-2.0/16.0,  6.0/16.0 }, { 0.0/16.0, -7.0/16.0 }, {-4.0/16.0, -6.0/16.0 }, {-6.0/16.0,  4.0/16.0 },
+      {-8.0/16.0,  0.0/16.0 }, { 7.0/16.0, -4.0/16.0 }, { 6.0/16.0,  7.0/16.0 }, {-7.0/16.0, -8.0/16.0 },
+  };
+
+  float2 position = float2(0.0f, 0.0f);
+
+  if (count == 2) {
+      position = pos2[index];
+  } else if (count == 4) {
+      position = pos4[index];
+  } else if (count == 8) {
+      position = pos8[index];
+  } else if (count == 16) {
+      position = pos16[index];
+  }
+
+From the above, it's clear that the current implementation only supports standard
+sample settings, i.e., with 1, 2, 4, 8, or 16 samples. For other cases, the
+implementation will just return `(float2)0`.
+
 ``Texture2DMSArray``
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -2047,6 +2158,10 @@ the instruction directly.
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
 Since Texture2DMS is represented as ``OpTypeImage`` with ``MS`` of ``1``, the ``OpImageQuerySize`` instruction
 is used to get the width, the height, and the elements. Furthermore, ``OpImageQuerySamples`` is used to get the numSamples.
+
+``.GetSamplePosition(index)``
++++++++++++++++++++++++++++++
+Similar to Texture2D.
 
 ``TextureCube``
 ~~~~~~~~~~~~~~~
@@ -2306,6 +2421,9 @@ codegen for Vulkan:
 - ``-fvk-ignore-unused-resources``: Avoids emitting SPIR-V code for resources
   defined but not statically referenced by the call tree of the entry point
   in question.
+- ``-fvk-invert-y``: Inverts SV_Position.y before writing to stage output.
+  Used to accommodate the difference between Vulkan's coordinate system and
+  DirectX's. Only allowed in VS/DS/GS.
 - ``-fvk-stage-io-order={alpha|decl}``: Assigns the stage input/output variable
   location number according to alphabetical order or declaration order. See
   `HLSL semantic and Vulkan Location`_ for more details.
@@ -2334,9 +2452,6 @@ either because of no Vulkan equivalents at the moment, or because of deprecation
 * ``.CalculateLevelOfDetailUnclamped()`` intrinsic method: no Vulkan equivalent.
   (SPIR-V ``OpImageQueryLod`` returns the clamped LOD in Vulkan.) The compiler
   will emit an error.
-* ``.GetSamplePosition()`` intrinsic method: no Vulkan equivalent.
-  (``gl_SamplePosition`` provides similar functionality but it's only for the
-  sample currently being processed.) The compiler will emit an error.
 * ``SV_InnerCoverage`` semantic does not have a Vulkan equivalent. The compiler
   will emit an error.
 * Since ``StructuredBuffer``, ``RWStructuredBuffer``, ``ByteAddressBuffer``, and
@@ -2349,3 +2464,7 @@ either because of no Vulkan equivalents at the moment, or because of deprecation
 * The Hull shader ``partitioning`` attribute may not have the ``pow2`` value. The compiler
   will emit an error. Other attribute values are supported and described in the
   `Hull Entry Point Attributes`_ section.
+* ``cbuffer``/``tbuffer`` member initializer: no Vulkan equivalent. The compiler
+  will emit an warning and ignore it.
+* ``:packoffset()``: Not supported right now. The compiler will emit an warning
+  and ignore it.

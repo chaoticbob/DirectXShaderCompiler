@@ -21,7 +21,7 @@
 
 #include "dxc/HLSL/DxilShaderModel.h"
 #include "dxc/HlslIntrinsicOp.h"
-#include "spirv/1.0/GLSL.std.450.h"
+#include "spirv/unified1/GLSL.std.450.h"
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -106,6 +106,25 @@ private:
   SpirvEvalInfo doMemberExpr(const MemberExpr *expr);
   SpirvEvalInfo doUnaryOperator(const UnaryOperator *expr);
 
+  /// Overload with pre computed SpirvEvalInfo.
+  ///
+  /// The given expr will not be evaluated again.
+  SpirvEvalInfo loadIfGLValue(const Expr *expr, SpirvEvalInfo info);
+
+  /// Loads the pointer of the aliased-to-variable if the given expression is a
+  /// DeclRefExpr referencing an alias variable. See DeclResultIdMapper for
+  /// more explanation regarding this.
+  ///
+  /// Note: legalization specific code
+  SpirvEvalInfo loadIfAliasVarRef(const Expr *expr);
+
+  /// Loads the pointer of the aliased-to-variable and ajusts aliasVarInfo
+  /// accordingly if aliasVarExpr is referencing an alias variable. Returns true
+  /// if aliasVarInfo is changed, false otherwise.
+  ///
+  /// Note: legalization specific code
+  bool loadIfAliasVarRef(const Expr *aliasVarExpr, SpirvEvalInfo &aliasVarInfo);
+
 private:
   /// Translates the given frontend binary operator into its SPIR-V equivalent
   /// taking consideration of the operand type.
@@ -120,14 +139,13 @@ private:
   /// lhs again.
   SpirvEvalInfo processAssignment(const Expr *lhs, const SpirvEvalInfo &rhs,
                                   bool isCompoundAssignment,
-                                  SpirvEvalInfo lhsPtr = 0,
-                                  const Expr *rhsExpr = nullptr);
+                                  SpirvEvalInfo lhsPtr = 0);
 
   /// Generates SPIR-V instructions to store rhsVal into lhsPtr. This will be
   /// recursive if lhsValType is a composite type. rhsExpr will be used as a
   /// reference to adjust the CodeGen if not nullptr.
   void storeValue(const SpirvEvalInfo &lhsPtr, const SpirvEvalInfo &rhsVal,
-                  QualType lhsValType, const Expr *rhsExpr = nullptr);
+                  QualType lhsValType);
 
   /// Generates the necessary instructions for conducting the given binary
   /// operation on lhs and rhs. If lhsResultId is not nullptr, the evaluated
@@ -135,7 +153,7 @@ private:
   /// mandateGenOpcode is not spv::Op::Max, it will used as the SPIR-V opcode
   /// instead of deducing from Clang frontend opcode.
   SpirvEvalInfo processBinaryOp(const Expr *lhs, const Expr *rhs,
-                                BinaryOperatorKind opcode, uint32_t resultType,
+                                BinaryOperatorKind opcode, QualType resultType,
                                 SourceRange, SpirvEvalInfo *lhsInfo = nullptr,
                                 spv::Op mandateGenOpcode = spv::Op::Max);
 
@@ -202,10 +220,6 @@ private:
   /// Tries to emit instructions for assigning to the given vector element
   /// accessing expression. Returns 0 if the trial fails and no instructions
   /// are generated.
-  ///
-  /// This method handles the cases that we are writing to neither one element
-  /// or all elements in their original order. For other cases, 0 will be
-  /// returned and the normal assignment process should be used.
   SpirvEvalInfo tryToAssignToVectorElements(const Expr *lhs,
                                             const SpirvEvalInfo &rhs);
 
@@ -229,6 +243,9 @@ private:
       llvm::function_ref<uint32_t(uint32_t, uint32_t, uint32_t)>
           actOnEachVector);
 
+  /// Translates the given varDecl into a spec constant.
+  void createSpecConstant(const VarDecl *varDecl);
+
   /// Generates the necessary instructions for conducting the given binary
   /// operation on lhs and rhs.
   ///
@@ -242,14 +259,17 @@ private:
   /// Returns the <result-id> of the variable.
   uint32_t SPIRVEmitter::createTemporaryVar(QualType varType,
                                             llvm::StringRef varName,
-                                            uint32_t initValue);
+                                            const SpirvEvalInfo &initValue);
 
   /// Collects all indices (SPIR-V constant values) from consecutive MemberExprs
   /// or ArraySubscriptExprs or operator[] calls and writes into indices.
-  /// Returns the real base.
+  /// Returns the real base. If rawIndex is set to true, the indices collected
+  /// will not be turned into SPIR-V constant values, and the base returned can
+  /// be nullptr, which means some indices are not constant.
   const Expr *
   collectArrayStructIndices(const Expr *expr,
-                            llvm::SmallVectorImpl<uint32_t> *indices);
+                            llvm::SmallVectorImpl<uint32_t> *indices,
+                            bool rawIndex = false);
 
   /// Creates an access chain to index into the given SPIR-V evaluation result
   /// and overwrites and returns the new SPIR-V evaluation result.
@@ -258,8 +278,9 @@ private:
                      const llvm::SmallVector<uint32_t, 4> &indices);
 
 private:
-  /// Validates that vk::* attributes are used correctly.
-  void validateVKAttributes(const NamedDecl *decl);
+  /// Validates that vk::* attributes are used correctly and returns false if
+  /// errors are found.
+  bool validateVKAttributes(const NamedDecl *decl);
 
 private:
   /// Processes the given expr, casts the result into the given bool (vector)
@@ -292,6 +313,9 @@ private:
 
   /// Processes the 'frexp' intrinsic function.
   uint32_t processIntrinsicFrexp(const CallExpr *);
+
+  /// Processes the 'ldexp' intrinsic function.
+  uint32_t processIntrinsicLdexp(const CallExpr *);
 
   /// Processes the 'D3DCOLORtoUBYTE4' intrinsic function.
   uint32_t processD3DCOLORtoUBYTE4(const CallExpr *);
@@ -414,8 +438,7 @@ private:
 
   /// Translates the given frontend APFloat into its SPIR-V equivalent for the
   /// given targetType.
-  uint32_t translateAPFloat(const llvm::APFloat &floatValue,
-                            QualType targetType);
+  uint32_t translateAPFloat(llvm::APFloat floatValue, QualType targetType);
 
   /// Tries to evaluate the given Expr as a constant and returns the <result-id>
   /// if success. Otherwise, returns 0.
@@ -430,6 +453,12 @@ private:
   /// can be performed without loss, it returns the <result-id> of the SPIR-V
   /// constant for that value.
   uint32_t tryToEvaluateAsInt32(const llvm::APInt &, bool isSigned);
+
+  /// Returns true iff the given expression is a literal integer that cannot be
+  /// represented in a 32-bit integer type or a literal float that cannot be
+  /// represented in a 32-bit float type without losing info. Returns false
+  /// otherwise.
+  bool isLiteralLargerThan32Bits(const Expr *expr);
 
 private:
   /// Translates the given HLSL loop attribute into SPIR-V loop control mask.
@@ -653,8 +682,36 @@ private:
   SpirvEvalInfo processStructuredBufferLoad(const CXXMemberCallExpr *expr);
 
   /// \brief Increments or decrements the counter for RW/Append/Consume
-  /// structured buffer.
-  uint32_t incDecRWACSBufferCounter(const CXXMemberCallExpr *, bool isInc);
+  /// structured buffer. If loadObject is true, the object upon which the call
+  /// is made will be evaluated and translated into SPIR-V.
+  uint32_t incDecRWACSBufferCounter(const CXXMemberCallExpr *call, bool isInc,
+                                    bool loadObject = true);
+
+  /// Assigns the counter variable associated with srcExpr to the one associated
+  /// with dstDecl if the dstDecl is an internal RW/Append/Consume structured
+  /// buffer. Returns false if there is no associated counter variable for
+  /// srcExpr or dstDecl.
+  ///
+  /// Note: legalization specific code
+  bool tryToAssignCounterVar(const DeclaratorDecl *dstDecl,
+                             const Expr *srcExpr);
+  bool tryToAssignCounterVar(const Expr *dstExpr, const Expr *srcExpr);
+
+  /// Returns the counter variable's information associated with the entity
+  /// represented by the given decl.
+  ///
+  /// This method only handles final alias structured buffers, which means
+  /// AssocCounter#1 and AssocCounter#2.
+  const CounterIdAliasPair *getFinalACSBufferCounter(const Expr *expr);
+  /// This method handles AssocCounter#3 and AssocCounter#4.
+  const CounterVarFields *
+  getIntermediateACSBufferCounter(const Expr *expr,
+                                  llvm::SmallVector<uint32_t, 4> *indices);
+
+  /// Gets or creates an ImplicitParamDecl to represent the implicit object
+  /// parameter of the given method.
+  const ImplicitParamDecl *
+  getOrCreateDeclForMethodObject(const CXXMethodDecl *method);
 
   /// \brief Loads numWords 32-bit unsigned integers or stores numWords 32-bit
   /// unsigned integers (based on the doStore parameter) to the given
@@ -675,6 +732,14 @@ private:
   uint32_t processRWByteAddressBufferAtomicMethods(hlsl::IntrinsicOp opcode,
                                                    const CXXMemberCallExpr *);
 
+  /// \brief Processes the GetSamplePosition intrinsic method call on a
+  /// Texture2DMS(Array).
+  uint32_t processGetSamplePosition(const CXXMemberCallExpr *);
+
+  /// \brief Processes the SubpassLoad intrinsic function call on a
+  /// SubpassInput(MS).
+  SpirvEvalInfo processSubpassLoad(const CXXMemberCallExpr *);
+
   /// \brief Generates SPIR-V instructions for the .Append()/.Consume() call on
   /// the given {Append|Consume}StructuredBuffer. Returns the <result-id> of
   /// the loaded value for .Consume; returns zero for .Append().
@@ -686,6 +751,10 @@ private:
   /// \brief Generates SPIR-V instructions to end emitting the current
   /// primitive in GS.
   uint32_t processStreamOutputRestart(const CXXMemberCallExpr *expr);
+
+  /// \brief Emulates GetSamplePosition() for standard sample settings, i.e.,
+  /// with 1, 2, 4, 8, or 16 samples. Returns float2(0) for other cases.
+  uint32_t emitGetSamplePosition(uint32_t sampleCount, uint32_t sampleIndex);
 
 private:
   /// \brief Takes a vector of size 4, and returns a vector of size 1 or 2 or 3
@@ -784,14 +853,35 @@ private:
   /// Invalid means no push constant blocks defined thus far.
   SourceLocation seenPushConstantAt;
 
+  /// Indicates whether the current emitter is in specialization constant mode:
+  /// all 32-bit scalar constants will be translated into OpSpecConstant.
+  bool isSpecConstantMode;
+
   /// Whether the translated SPIR-V binary needs legalization.
   ///
   /// The following cases will require legalization:
-  /// * Opaque types (textures, samplers) within structs
+  ///
+  /// 1. Opaque types (textures, samplers) within structs
+  /// 2. Structured buffer assignments
+  ///
+  /// This covers the first case.
   ///
   /// If this is true, SPIRV-Tools legalization passes will be executed after
   /// the translation to legalize the generated SPIR-V binary.
+  ///
+  /// Note: legalization specific code
   bool needsLegalization;
+
+  /// Mapping from methods to the decls to represent their implicit object
+  /// parameters
+  ///
+  /// We need this map because that we need to update the associated counters on
+  /// the implicit object when invoking method calls. The ImplicitParamDecl
+  /// mapped to serves as a key to find the associated counters in
+  /// DeclResultIdMapper.
+  ///
+  /// Note: legalization specific code
+  llvm::DenseMap<const CXXMethodDecl *, const ImplicitParamDecl *> thisDecls;
 
   /// Global variables that should be initialized once at the begining of the
   /// entry function.
