@@ -60,31 +60,6 @@ bool patchConstFuncTakesHullOutputPatch(FunctionDecl *pcf) {
 
 // TODO: Maybe we should move these type probing functions to TypeTranslator.
 
-/// Returns true if the two types are the same scalar or vector type.
-bool isSameScalarOrVecType(QualType type1, QualType type2) {
-  // Consider cases such as 'const bool' and 'bool' to be the same type.
-  type1.removeLocalConst();
-  type2.removeLocalConst();
-
-  {
-    QualType scalarType1 = {}, scalarType2 = {};
-    if (TypeTranslator::isScalarType(type1, &scalarType1) &&
-        TypeTranslator::isScalarType(type2, &scalarType2))
-      return scalarType1.getCanonicalType() == scalarType2.getCanonicalType();
-  }
-
-  {
-    QualType elemType1 = {}, elemType2 = {};
-    uint32_t count1 = {}, count2 = {};
-    if (TypeTranslator::isVectorType(type1, &elemType1, &count1) &&
-        TypeTranslator::isVectorType(type2, &elemType2, &count2))
-      return count1 == count2 &&
-             elemType1.getCanonicalType() == elemType2.getCanonicalType();
-  }
-
-  return false;
-}
-
 /// Returns true if the given type is a bool or vector of bool type.
 bool isBoolOrVecOfBoolType(QualType type) {
   QualType elemType = {};
@@ -449,6 +424,49 @@ const DeclaratorDecl *getReferencedDef(const Expr *expr) {
   }
 
   return nullptr;
+}
+
+/// Returns the number of base classes if this type is a derived class/struct.
+/// Returns zero otherwise.
+inline uint32_t getNumBaseClasses(QualType type) {
+  if (const auto *cxxDecl = type->getAsCXXRecordDecl())
+    return cxxDecl->getNumBases();
+  return 0;
+}
+
+/// Gets the index sequence of casting a derived object to a base object by
+/// following the cast chain.
+void getBaseClassIndices(const CastExpr *expr,
+                         llvm::SmallVectorImpl<uint32_t> *indices) {
+  assert(expr->getCastKind() == CK_UncheckedDerivedToBase);
+
+  indices->clear();
+
+  QualType derivedType = expr->getSubExpr()->getType();
+  const auto *derivedDecl = derivedType->getAsCXXRecordDecl();
+
+  // Go through the base cast chain: for each of the derived to base cast, find
+  // the index of the base in question in the derived's bases.
+  for (auto pathIt = expr->path_begin(), pathIe = expr->path_end();
+       pathIt != pathIe; ++pathIt) {
+    // The type of the base in question
+    const auto baseType = (*pathIt)->getType();
+
+    uint32_t index = 0;
+    for (auto baseIt = derivedDecl->bases_begin(),
+              baseIe = derivedDecl->bases_end();
+         baseIt != baseIe; ++baseIt, ++index)
+      if (baseIt->getType() == baseType) {
+        indices->push_back(index);
+        break;
+      }
+
+    assert(index < derivedDecl->getNumBases());
+
+    // Continue to proceed the next base in the chain
+    derivedType = baseType;
+    derivedDecl = derivedType->getAsCXXRecordDecl();
+  }
 }
 
 } // namespace
@@ -1882,6 +1900,24 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
   const QualType subExprType = subExpr->getType();
   const QualType toType = expr->getType();
 
+  // Unfortunately the front-end fails to deduce some types in certain cases.
+  // Provide a hint about literal type usage if possible.
+  TypeTranslator::LiteralTypeHint hint(typeTranslator);
+
+  // 'literal int' to 'float' conversion. If a literal integer is to be used as
+  // a 32-bit float, the hint is a 32-bit integer.
+  if (toType->isFloatingType() &&
+      subExprType->isSpecificBuiltinType(BuiltinType::LitInt) &&
+      llvm::APFloat::getSizeInBits(astContext.getFloatTypeSemantics(toType)) ==
+          32)
+    hint.setHint(astContext.IntTy);
+  // TODO: We could provide other useful hints. For instance:
+  // For the case of toType being a boolean, if the fromType is a literal float,
+  // we could provide a FloatTy hint and if the fromType is a literal integer,
+  // we could provide an IntTy hint. The front-end, however, seems to deduce the
+  // correct type in these cases; therefore we currently don't provide any
+  // additional hints.
+
   switch (expr->getCastKind()) {
   case CastKind::CK_LValueToRValue:
     return loadIfGLValue(subExpr);
@@ -2111,12 +2147,36 @@ SpirvEvalInfo SPIRVEmitter::doCastExpr(const CastExpr *expr) {
       if (subExprId)
         evalType = isSigned ? astContext.IntTy : astContext.UnsignedIntTy;
     }
+    // For assigning one array instance to another one with the same array type
+    // (regardless of constness and literalness), the rhs will be wrapped in a
+    // FlatConversion:
+    //  |- <lhs>
+    //  `- ImplicitCastExpr <FlatConversion>
+    //     `- ImplicitCastExpr <LValueToRValue>
+    //        `- <rhs>
+    // This FlatConversion does not affect CodeGen, so that we can ignore it.
+    else if (subExprType->isArrayType() &&
+             typeTranslator.isSameType(expr->getType(), subExprType)) {
+      return doExpr(subExpr);
+    }
 
     if (!subExprId)
       subExprId = doExpr(subExpr);
     const auto valId =
         processFlatConversion(toType, evalType, subExprId, expr->getExprLoc());
     return SpirvEvalInfo(valId).setRValue();
+  }
+  case CastKind::CK_UncheckedDerivedToBase: {
+    // Find the index sequence of the base to which we are casting
+    llvm::SmallVector<uint32_t, 4> baseIndices;
+    getBaseClassIndices(expr, &baseIndices);
+
+    // Turn them in to SPIR-V constants
+    for (uint32_t i = 0; i < baseIndices.size(); ++i)
+      baseIndices[i] = theBuilder.getConstantUint32(baseIndices[i]);
+
+    auto derivedInfo = doExpr(subExpr);
+    return turnIntoElementPtr(derivedInfo, expr->getType(), baseIndices);
   }
   default:
     emitError("implicit cast kind '%0' unimplemented", expr->getExprLoc())
@@ -5340,7 +5400,11 @@ const Expr *SPIRVEmitter::collectArrayStructIndices(
     // Append the index of the current level
     const auto *fieldDecl = cast<FieldDecl>(indexing->getMemberDecl());
     assert(fieldDecl);
-    const uint32_t index = fieldDecl->getFieldIndex();
+    // If we are accessing a derived struct, we need to account for the number
+    // of base structs, since they are placed as fields at the beginning of the
+    // derived struct.
+    const uint32_t index = getNumBaseClasses(indexing->getBase()->getType()) +
+                           fieldDecl->getFieldIndex();
     indices->push_back(rawIndex ? index : theBuilder.getConstantInt32(index));
 
     return base;
@@ -5432,7 +5496,7 @@ SpirvEvalInfo &SPIRVEmitter::turnIntoElementPtr(
 
 uint32_t SPIRVEmitter::castToBool(const uint32_t fromVal, QualType fromType,
                                   QualType toBoolType) {
-  if (isSameScalarOrVecType(fromType, toBoolType))
+  if (TypeTranslator::isSameScalarOrVecType(fromType, toBoolType))
     return fromVal;
 
   // Converting to bool means comparing with value zero.
@@ -5445,15 +5509,10 @@ uint32_t SPIRVEmitter::castToBool(const uint32_t fromVal, QualType fromType,
 
 uint32_t SPIRVEmitter::castToInt(const uint32_t fromVal, QualType fromType,
                                  QualType toIntType, SourceLocation srcLoc) {
-  if (isSameScalarOrVecType(fromType, toIntType))
+  if (TypeTranslator::isSameScalarOrVecType(fromType, toIntType))
     return fromVal;
 
   uint32_t intType = typeTranslator.translateType(toIntType);
-
-  // AST may include a 'literal int' to 'int' conversion. No-op.
-  if (fromType->isSpecificBuiltinType(BuiltinType::LitInt) &&
-      toIntType->isIntegerType())
-    return fromVal;
 
   if (isBoolOrVecOfBoolType(fromType)) {
     const uint32_t one = getValueOne(toIntType);
@@ -5484,15 +5543,10 @@ uint32_t SPIRVEmitter::castToInt(const uint32_t fromVal, QualType fromType,
 uint32_t SPIRVEmitter::castToFloat(const uint32_t fromVal, QualType fromType,
                                    QualType toFloatType,
                                    SourceLocation srcLoc) {
-  if (isSameScalarOrVecType(fromType, toFloatType))
+  if (TypeTranslator::isSameScalarOrVecType(fromType, toFloatType))
     return fromVal;
 
   const uint32_t floatType = typeTranslator.translateType(toFloatType);
-
-  // AST may include a 'literal float' to 'float' conversion. No-op.
-  if (fromType->isSpecificBuiltinType(BuiltinType::LitFloat) &&
-      toFloatType->isFloatingType())
-    return fromVal;
 
   if (isBoolOrVecOfBoolType(fromType)) {
     const uint32_t one = getValueOne(toFloatType);

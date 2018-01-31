@@ -48,6 +48,9 @@ TEST_F(FileTest, MatrixTypes) { runFileTest("type.matrix.hlsl"); }
 TEST_F(FileTest, MatrixTypesMajornessZpr) {
   runFileTest("type.matrix.majorness.zpr.hlsl");
 }
+TEST_F(FileTest, MatrixTypesMajornessZpc) {
+  runFileTest("type.matrix.majorness.zpc.hlsl");
+}
 TEST_F(FileTest, MatrixTypesMajorness) {
   runFileTest("type.matrix.majorness.hlsl", Expect::Warning);
 }
@@ -320,6 +323,9 @@ TEST_F(FileTest, CastImplicitFlatConversion) {
 TEST_F(FileTest, CastFlatConversionStruct) {
   runFileTest("cast.flat-conversion.struct.hlsl");
 }
+TEST_F(FileTest, CastFlatConversionNoOp) {
+  runFileTest("cast.flat-conversion.no-op.hlsl");
+}
 TEST_F(FileTest, CastExplicitVecToMat) {
   runFileTest("cast.vec-to-mat.explicit.hlsl");
 }
@@ -409,6 +415,10 @@ TEST_F(FileTest, StaticMemberInitializer) {
 }
 TEST_F(FileTest, MethodCallOnStaticVar) {
   runFileTest("oo.method.on-static-var.hlsl");
+}
+TEST_F(FileTest, Inheritance) { runFileTest("oo.inheritance.hlsl"); }
+TEST_F(FileTest, InheritanceStageIO) {
+  runFileTest("oo.inheritance.stage-io.hlsl");
 }
 
 // For semantics

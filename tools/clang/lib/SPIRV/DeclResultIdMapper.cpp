@@ -93,6 +93,14 @@ inline QualType getTypeOrFnRetType(const DeclaratorDecl *decl) {
   }
   return decl->getType();
 }
+
+/// Returns the number of base classes if this type is a derived class/struct.
+/// Returns zero otherwise.
+inline uint32_t getNumBaseClasses(QualType type) {
+  if (const auto *cxxDecl = type->getAsCXXRecordDecl())
+    return cxxDecl->getNumBases();
+  return 0;
+}
 } // anonymous namespace
 
 std::string StageVar::getSemanticStr() const {
@@ -183,7 +191,7 @@ bool CounterVarFields::assign(const CounterVarFields &srcFields,
 }
 
 DeclResultIdMapper::SemanticInfo
-DeclResultIdMapper::getStageVarSemantic(const ValueDecl *decl) {
+DeclResultIdMapper::getStageVarSemantic(const NamedDecl *decl) {
   for (auto *annotation : decl->getUnusualAnnotations()) {
     if (auto *sema = dyn_cast<hlsl::SemanticDecl>(annotation)) {
       llvm::StringRef semanticStr = sema->SemanticName;
@@ -687,7 +695,8 @@ void DeclResultIdMapper::createFieldCounterVars(
   const auto *recordDecl = recordType->getDecl();
 
   for (const auto *field : recordDecl->fields()) {
-    indices->push_back(field->getFieldIndex()); // Build up the index chain
+    // Build up the index chain
+    indices->push_back(getNumBaseClasses(type) + field->getFieldIndex());
 
     const QualType fieldType = field->getType();
     if (TypeTranslator::isRWAppendConsumeSBuffer(fieldType))
@@ -1071,11 +1080,13 @@ bool DeclResultIdMapper::decorateResourceBindings() {
   return true;
 }
 
-bool DeclResultIdMapper::createStageVars(
-    const hlsl::SigPoint *sigPoint, const DeclaratorDecl *decl, bool asInput,
-    QualType type, uint32_t arraySize, const llvm::StringRef namePrefix,
-    llvm::Optional<uint32_t> invocationId, uint32_t *value, bool noWriteBack,
-    SemanticInfo *inheritSemantic) {
+bool DeclResultIdMapper::createStageVars(const hlsl::SigPoint *sigPoint,
+                                         const NamedDecl *decl, bool asInput,
+                                         QualType type, uint32_t arraySize,
+                                         const llvm::StringRef namePrefix,
+                                         llvm::Optional<uint32_t> invocationId,
+                                         uint32_t *value, bool noWriteBack,
+                                         SemanticInfo *inheritSemantic) {
   // invocationId should only be used for handling HS per-vertex output.
   if (invocationId.hasValue()) {
     assert(shaderModel.IsHS() && arraySize != 0 && !asInput);
@@ -1212,7 +1223,9 @@ bool DeclResultIdMapper::createStageVars(
     stageVar.setSpirvId(varId);
     stageVar.setLocationAttr(decl->getAttr<VKLocationAttr>());
     stageVars.push_back(stageVar);
-    stageVarIds[decl] = varId;
+    // We have semantics attached to this decl, which means it must be a
+    // function/parameter/variable. All are DeclaratorDecls.
+    stageVarIds[cast<DeclaratorDecl>(decl)] = varId;
 
     // Mark that we have used one index for this semantic
     ++semanticToUse->index;
@@ -1379,6 +1392,18 @@ bool DeclResultIdMapper::createStageVars(
     // load their values into a composite.
     llvm::SmallVector<uint32_t, 4> subValues;
 
+    // If we have base classes, we need to handle them first.
+    if (const auto *cxxDecl = type->getAsCXXRecordDecl())
+      for (auto base : cxxDecl->bases()) {
+        uint32_t subValue = 0;
+        if (!createStageVars(sigPoint, base.getType()->getAsCXXRecordDecl(),
+                             asInput, base.getType(), arraySize, namePrefix,
+                             invocationId, &subValue, noWriteBack,
+                             semanticToUse))
+          return false;
+        subValues.push_back(subValue);
+      }
+
     for (const auto *field : structDecl->fields()) {
       uint32_t subValue = 0;
       if (!createStageVars(sigPoint, field, asInput, field->getType(),
@@ -1412,7 +1437,9 @@ bool DeclResultIdMapper::createStageVars(
         const uint32_t fieldType =
             typeTranslator.translateType(field->getType());
         fields.push_back(theBuilder.createCompositeExtract(
-            fieldType, subValues[field->getFieldIndex()], {arrayIndex}));
+            fieldType,
+            subValues[getNumBaseClasses(type) + field->getFieldIndex()],
+            {arrayIndex}));
       }
       // Compose a new struct out of them
       arrayElements.push_back(
@@ -1421,6 +1448,24 @@ bool DeclResultIdMapper::createStageVars(
 
     *value = theBuilder.createCompositeConstruct(arrayType, arrayElements);
   } else {
+    // If we have base classes, we need to handle them first.
+    if (const auto *cxxDecl = type->getAsCXXRecordDecl()) {
+      uint32_t baseIndex = 0;
+      for (auto base : cxxDecl->bases()) {
+        uint32_t subValue = 0;
+        if (!noWriteBack)
+          subValue = theBuilder.createCompositeExtract(
+              typeTranslator.translateType(base.getType()), *value,
+              {baseIndex++});
+
+        if (!createStageVars(sigPoint, base.getType()->getAsCXXRecordDecl(),
+                             asInput, base.getType(), arraySize, namePrefix,
+                             invocationId, &subValue, noWriteBack,
+                             semanticToUse))
+          return false;
+      }
+    }
+
     // Unlike reading, which may require us to read stand-alone builtins and
     // stage input variables and compose an array of structs out of them,
     // it happens that we don't need to write an array of structs in a bunch
@@ -1438,8 +1483,9 @@ bool DeclResultIdMapper::createStageVars(
       const uint32_t fieldType = typeTranslator.translateType(field->getType());
       uint32_t subValue = 0;
       if (!noWriteBack)
-        subValue = theBuilder.createCompositeExtract(fieldType, *value,
-                                                     {field->getFieldIndex()});
+        subValue = theBuilder.createCompositeExtract(
+            fieldType, *value,
+            {getNumBaseClasses(type) + field->getFieldIndex()});
 
       if (!createStageVars(sigPoint, field, asInput, field->getType(),
                            arraySize, namePrefix, invocationId, &subValue,
@@ -1514,7 +1560,7 @@ bool DeclResultIdMapper::writeBackOutputStream(const ValueDecl *decl,
   for (const auto *field : structDecl->fields()) {
     const uint32_t fieldType = typeTranslator.translateType(field->getType());
     const uint32_t subValue = theBuilder.createCompositeExtract(
-        fieldType, value, {field->getFieldIndex()});
+        fieldType, value, {getNumBaseClasses(type) + field->getFieldIndex()});
 
     if (!writeBackOutputStream(field, subValue))
       return false;
@@ -1523,7 +1569,7 @@ bool DeclResultIdMapper::writeBackOutputStream(const ValueDecl *decl,
   return true;
 }
 
-void DeclResultIdMapper::decoratePSInterpolationMode(const DeclaratorDecl *decl,
+void DeclResultIdMapper::decoratePSInterpolationMode(const NamedDecl *decl,
                                                      QualType type,
                                                      uint32_t varId) {
   const QualType elemType = typeTranslator.getElementType(type);
@@ -1557,7 +1603,7 @@ void DeclResultIdMapper::decoratePSInterpolationMode(const DeclaratorDecl *decl,
 }
 
 uint32_t DeclResultIdMapper::createSpirvStageVar(StageVar *stageVar,
-                                                 const DeclaratorDecl *decl,
+                                                 const NamedDecl *decl,
                                                  const llvm::StringRef name,
                                                  SourceLocation srcLoc) {
   using spv::BuiltIn;
@@ -1912,12 +1958,14 @@ uint32_t DeclResultIdMapper::createSpirvStageVar(StageVar *stageVar,
   return 0;
 }
 
-bool DeclResultIdMapper::validateVKBuiltins(const DeclaratorDecl *decl,
+bool DeclResultIdMapper::validateVKBuiltins(const NamedDecl *decl,
                                             const hlsl::SigPoint *sigPoint) {
   bool success = true;
 
   if (const auto *builtinAttr = decl->getAttr<VKBuiltInAttr>()) {
-    const auto declType = getTypeOrFnRetType(decl);
+    // The front end parsing only allows vk::builtin to be attached to a
+    // function/parameter/variable; all of them are DeclaratorDecls.
+    const auto declType = getTypeOrFnRetType(cast<DeclaratorDecl>(decl));
     const auto loc = builtinAttr->getLocation();
 
     if (decl->hasAttr<VKLocationAttr>()) {
