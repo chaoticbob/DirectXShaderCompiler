@@ -51,9 +51,6 @@ TEST_F(FileTest, MatrixTypesMajornessZpr) {
 TEST_F(FileTest, MatrixTypesMajornessZpc) {
   runFileTest("type.matrix.majorness.zpc.hlsl");
 }
-TEST_F(FileTest, MatrixTypesMajorness) {
-  runFileTest("type.matrix.majorness.hlsl", Expect::Warning);
-}
 TEST_F(FileTest, StructTypes) { runFileTest("type.struct.hlsl"); }
 TEST_F(FileTest, ClassTypes) { runFileTest("type.class.hlsl"); }
 TEST_F(FileTest, ArrayTypes) { runFileTest("type.array.hlsl"); }
@@ -123,6 +120,10 @@ TEST_F(FileTest, VarInitCrossStorageClass) {
   runFileTest("var.init.cross-storage-class.hlsl");
 }
 TEST_F(FileTest, StaticVar) { runFileTest("var.static.hlsl"); }
+TEST_F(FileTest, UninitStaticResourceVar) {
+  runFileTest("var.static.resource.hlsl");
+}
+TEST_F(FileTest, GlobalMatrixVar) { runFileTest("var.global-mat.hlsl"); }
 
 // For prefix/postfix increment/decrement
 TEST_F(FileTest, UnaryOpPrefixIncrement) {
@@ -417,8 +418,11 @@ TEST_F(FileTest, MethodCallOnStaticVar) {
   runFileTest("oo.method.on-static-var.hlsl");
 }
 TEST_F(FileTest, Inheritance) { runFileTest("oo.inheritance.hlsl"); }
-TEST_F(FileTest, InheritanceStageIO) {
-  runFileTest("oo.inheritance.stage-io.hlsl");
+TEST_F(FileTest, InheritanceStageIOVS) {
+  runFileTest("oo.inheritance.stage-io.vs.hlsl");
+}
+TEST_F(FileTest, InheritanceStageIOGS) {
+  runFileTest("oo.inheritance.stage-io.gs.hlsl");
 }
 
 // For semantics
@@ -900,6 +904,9 @@ TEST_F(FileTest, IntrinsicsGetRenderTargetSamplePosition) {
 }
 
 // For attributes
+TEST_F(FileTest, AttributeEarlyDepthStencil) {
+  runFileTest("attribute.earlydepthstencil.ps.hlsl");
+}
 TEST_F(FileTest, AttributeNumThreads) {
   runFileTest("attribute.numthreads.hlsl");
 }

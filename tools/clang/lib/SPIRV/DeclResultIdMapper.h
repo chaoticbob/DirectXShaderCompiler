@@ -424,7 +424,8 @@ public:
   ///
   /// This method is specially for writing back per-vertex data at the time of
   /// OpEmitVertex in GS.
-  bool writeBackOutputStream(const ValueDecl *decl, uint32_t value);
+  bool writeBackOutputStream(const NamedDecl *decl, QualType type,
+                             uint32_t value);
 
   /// \brief Decorates all stage input and output variables with proper
   /// location and returns true on success.
@@ -491,6 +492,11 @@ private:
   /// This method will write the location assignment into the module under
   /// construction.
   bool finalizeStageIOLocations(bool forInput);
+
+  /// \brief Wraps the given matrix type with a struct and returns the struct
+  /// type's <result-id>.
+  uint32_t getMatrixStructType(const VarDecl *matVar, spv::StorageClass,
+                               LayoutRule);
 
   /// \brief An enum class for representing what the DeclContext is used for
   enum class ContextUsageKind {
@@ -647,7 +653,8 @@ private:
   /// The following cases will require legalization:
   ///
   /// 1. Opaque types (textures, samplers) within structs
-  /// 2. Structured buffer assignments
+  /// 2. Structured buffer aliasing
+  /// 3. Using SPIR-V instructions not allowed in the currect shader stage
   ///
   /// This covers the second case:
   ///

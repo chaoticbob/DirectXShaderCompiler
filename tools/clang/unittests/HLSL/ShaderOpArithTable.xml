@@ -514,7 +514,7 @@
             <Parameter Name="Validation.Expected1">
                 <Value>NaN</Value>
                 <Value>NaN</Value>
-                <Value>NaN</Value>
+                <Value>-0</Value>
                 <Value>-0</Value>
                 <Value>0</Value>
                 <Value>0</Value>
@@ -1867,10 +1867,9 @@
             <Parameter Name="Validation.Input1">
                 <Value>NaN</Value>
                 <Value>-Inf</Value>
-                <Value>-denorm</Value>
+                <Value>0x03FF</Value>
                 <Value>-0</Value>
                 <Value>0</Value>
-                <Value>denorm</Value>
                 <Value>Inf</Value>
                 <Value>-1</Value>
                 <Value>2.719</Value>
@@ -1880,8 +1879,7 @@
             <Parameter Name="Validation.Expected1">
                 <Value>NaN</Value>
                 <Value>NaN</Value>
-                <Value>0</Value>
-                <Value>0</Value>
+                <Value>0x03FF</Value>
                 <Value>0</Value>
                 <Value>0</Value>
                 <Value>NaN</Value>
@@ -2087,7 +2085,7 @@
                 <Value>NaN</Value>
                 <Value>-Inf</Value>
                 <Value>Inf</Value>
-                <Value>0x5800</Value>
+                <Value>0x5801</Value>
                 <Value>0</Value>
                 <Value>NaN</Value>
                 <Value>0.25</Value>
@@ -2128,7 +2126,7 @@
                 <Value>NaN</Value>
                 <Value>NaN</Value>
                 <Value>NaN</Value>
-                <Value>0</Value>
+                <Value>-0</Value>
                 <Value>0</Value>
                 <Value>0x1FFF</Value>
                 <Value>Inf</Value>
@@ -5779,6 +5777,7 @@
             <ParameterType Array="true" Name="Validation.Input1">String</ParameterType>
             <ParameterType Array="true" Name="Validation.Input2">String</ParameterType>
             <ParameterType Array="true" Name="Validation.Expected1">String</ParameterType>
+            <ParameterType Array="true" Name="Validation.Expected2">String</ParameterType>
         </ParameterTypes>
         <Row Name="FDivDenormFTZ">
             <Parameter Name="Validation.Type">ulp</Parameter>
@@ -5811,7 +5810,7 @@
             </Parameter>
             <Parameter Name="Validation.Expected1">
                 <Value>0</Value>
-                <Value>1</Value>
+                <Value>NaN</Value>
                 <Value>0</Value>
                 <Value>0</Value>
             </Parameter>
@@ -5848,9 +5847,15 @@
             </Parameter>
             <Parameter Name="Validation.Expected1">
                 <Value>0x00FC0000</Value>
-                <Value>0</Value>
+                <Value>0x00400000</Value>
                 <Value>0</Value>
                 <Value>0x00700000</Value>
+            </Parameter>
+            <Parameter Name="Validation.Expected2">
+                <Value>0</Value>
+                <Value>0</Value>
+                <Value>0</Value>
+                <Value>0</Value>
             </Parameter>
             <Parameter Name="ShaderOp.Arguments">-denorm any</Parameter>
         </Row>
@@ -5892,6 +5897,13 @@
                 <Value>0x01960000</Value>
                 <Value>0x32400000</Value>
             </Parameter>
+            <Parameter Name="Validation.Expected2">
+                <Value>0</Value>
+                <Value>0</Value>
+                <Value>0</Value>
+                <Value>0</Value>
+                <Value>0</Value>
+            </Parameter>
             <Parameter Name="ShaderOp.Arguments">-denorm any</Parameter>
         </Row>
         <Row Name="FDivDenormAny">
@@ -5928,6 +5940,12 @@
                 <Value>1</Value>
                 <Value>0x00404040</Value>
                 <Value>0x00400000</Value>
+            </Parameter>
+            <Parameter Name="Validation.Expected2">
+                <Value>0</Value>
+                <Value>NaN</Value>
+                <Value>0</Value>
+                <Value>0</Value>
             </Parameter>
             <Parameter Name="ShaderOp.Arguments">-denorm any</Parameter>
         </Row>
@@ -5966,8 +5984,8 @@
                 <Value>0</Value>
                 <Value>0</Value>
                 <Value>0</Value>
-                <Value>0x01960000</Value>
-                <Value>0x32400000</Value>
+                <Value>0</Value>
+                <Value>0</Value>
             </Parameter>
             <Parameter Name="ShaderOp.Arguments">-denorm ftz</Parameter>
         </Row>
@@ -6001,7 +6019,7 @@
                 <Value>0x800E0000</Value>
             </Parameter>
             <Parameter Name="Validation.Expected1">
-                <Value>0x00FC0000</Value>
+                <Value>0</Value>
                 <Value>0</Value>
                 <Value>0</Value>
                 <Value>0</Value>
@@ -6076,7 +6094,7 @@
             </Parameter>
             <Parameter Name="Validation.Expected1">
                 <Value>0x0</Value>
-                <Value>0x00FE0000</Value>
+                <Value>0</Value>
                 <Value>0</Value>
                 <Value>0</Value>
             </Parameter>
@@ -6154,6 +6172,12 @@
                 <Value>0x007F0000</Value>
                 <Value>0x007A0000</Value>
             </Parameter>
+            <Parameter Name="Validation.Expected2">
+                <Value>0x0</Value>
+                <Value>0</Value>
+                <Value>0</Value>
+                <Value>0</Value>
+            </Parameter>
             <Parameter Name="ShaderOp.Arguments">-denorm any</Parameter>
         </Row>
         <Row Name="FAddDenormPreserve">
@@ -6187,7 +6211,7 @@
             </Parameter>
             <Parameter Name="Validation.Expected1">
                 <Value>0x00FC0000</Value>
-                <Value>0</Value>
+                <Value>0x00400000</Value>
                 <Value>0</Value>
                 <Value>0x00700000</Value>
             </Parameter>
@@ -6245,6 +6269,7 @@
             <ParameterType Array="true" Name="Validation.Input2">String</ParameterType>
             <ParameterType Array="true" Name="Validation.Input3">String</ParameterType>
             <ParameterType Array="true" Name="Validation.Expected1">String</ParameterType>
+            <ParameterType Array="true" Name="Validation.Expected2">String</ParameterType>
         </ParameterTypes>
         <Row Name="FMadDenormPreserve">
             <Parameter Name="Validation.Type">ulp</Parameter>
@@ -6322,6 +6347,11 @@
                 <Value>0x80700000</Value>
                 <Value>0x01380000</Value>
             </Parameter>
+            <Parameter Name="Validation.Expected2">
+                <Value>0</Value>
+                <Value>0x00800000</Value>
+                <Value>0x00800000</Value>
+            </Parameter>
             <Parameter Name="ShaderOp.Arguments">-denorm any</Parameter>
         </Row>
         <Row Name="FMadDenormFTZ">
@@ -6358,8 +6388,8 @@
             </Parameter>
             <Parameter Name="Validation.Expected1">
                 <Value>0</Value>
-                <Value>0</Value>
-                <Value>0x01380000</Value>
+                <Value>0x00800000</Value>
+                <Value>0x00800000</Value>
             </Parameter>
             <Parameter Name="ShaderOp.Arguments">-denorm ftz</Parameter>
         </Row>

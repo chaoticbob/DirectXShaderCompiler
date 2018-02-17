@@ -383,11 +383,21 @@ uint32_t DeclResultIdMapper::createFileVar(const VarDecl *var,
 uint32_t DeclResultIdMapper::createExternVar(const VarDecl *var) {
   auto storageClass = spv::StorageClass::UniformConstant;
   auto rule = LayoutRule::Void;
+  bool isMatType = false;     // Whether this var is of matrix type
   bool isACRWSBuffer = false; // Whether its {Append|Consume|RW}StructuredBuffer
 
   if (var->getAttr<HLSLGroupSharedAttr>()) {
     // For CS groupshared variables
     storageClass = spv::StorageClass::Workgroup;
+  } else if (TypeTranslator::isMxNMatrix(var->getType())) {
+    isMatType = true;
+    // According to HLSL doc:
+    //   Variables that are placed in the global scope are added implicitly to
+    //   the $Global cbuffer, using the same packing method that is used for
+    //   cbuffers.
+    // So we should translate stand-alone matrices like cbuffer.
+    storageClass = spv::StorageClass::Uniform;
+    rule = LayoutRule::GLSLStd140;
   } else if (auto *t = var->getType()->getAs<RecordType>()) {
     const llvm::StringRef typeName = t->getDecl()->getName();
 
@@ -407,11 +417,25 @@ uint32_t DeclResultIdMapper::createExternVar(const VarDecl *var) {
     }
   }
 
-  const auto varType = typeTranslator.translateType(var->getType(), rule);
+  uint32_t varType = 0;
+
+  if (isMatType) {
+    // For stand-alone matrices, we need to wrap it in a struct so that we can
+    // annotate the majorness decoration.
+    varType = getMatrixStructType(var, storageClass, rule);
+  } else {
+    varType = typeTranslator.translateType(var->getType(), rule);
+  }
+
   const uint32_t id = theBuilder.addModuleVar(varType, storageClass,
                                               var->getName(), llvm::None);
   astDecls[var] =
       SpirvEvalInfo(id).setStorageClass(storageClass).setLayoutRule(rule);
+  if (isMatType) {
+    // We have wrapped the stand-alone matrix inside a struct. Mark it as
+    // needing an extra index to access.
+    astDecls[var].indexInCTBuffer = 0;
+  }
 
   const auto *regAttr = getResourceBinding(var);
   const auto *bindingAttr = var->getAttr<VKBindingAttr>();
@@ -430,6 +454,30 @@ uint32_t DeclResultIdMapper::createExternVar(const VarDecl *var) {
   }
 
   return id;
+}
+
+uint32_t DeclResultIdMapper::getMatrixStructType(const VarDecl *matVar,
+                                                 spv::StorageClass sc,
+                                                 LayoutRule rule) {
+  const auto matType = matVar->getType();
+  assert(TypeTranslator::isMxNMatrix(matType));
+
+  auto &context = *theBuilder.getSPIRVContext();
+  llvm::SmallVector<const Decoration *, 4> decorations;
+  const bool isRowMajor = typeTranslator.isRowMajorMatrix(matType, matVar);
+
+  uint32_t stride;
+  (void)typeTranslator.getAlignmentAndSize(matType, rule, isRowMajor, &stride);
+  decorations.push_back(Decoration::getOffset(context, 0, 0));
+  decorations.push_back(Decoration::getMatrixStride(context, stride, 0));
+  decorations.push_back(isRowMajor ? Decoration::getColMajor(context, 0)
+                                   : Decoration::getRowMajor(context, 0));
+  decorations.push_back(Decoration::getBlock(context));
+
+  // Get the type for the wrapping struct
+  const std::string structName = "type." + matVar->getName().str();
+  return theBuilder.getStructType({typeTranslator.translateType(matType)},
+                                  structName, {}, decorations);
 }
 
 uint32_t DeclResultIdMapper::createVarOfExplicitLayoutStruct(
@@ -507,9 +555,8 @@ uint32_t DeclResultIdMapper::createCTBuffer(const HLSLBufferDecl *decl) {
   const auto usageKind =
       decl->isCBuffer() ? ContextUsageKind::CBuffer : ContextUsageKind::TBuffer;
   const std::string structName = "type." + decl->getName().str();
-  const std::string varName = "var." + decl->getName().str();
-  const uint32_t bufferVar =
-      createVarOfExplicitLayoutStruct(decl, usageKind, structName, varName);
+  const uint32_t bufferVar = createVarOfExplicitLayoutStruct(
+      decl, usageKind, structName, decl->getName());
 
   // We still register all VarDecls seperately here. All the VarDecls are
   // mapped to the <result-id> of the buffer object, which means when querying
@@ -1432,6 +1479,16 @@ bool DeclResultIdMapper::createStageVars(const hlsl::SigPoint *sigPoint,
     for (uint32_t arrayIndex = 0; arrayIndex < arraySize; ++arrayIndex) {
       llvm::SmallVector<uint32_t, 8> fields;
 
+      // If we have base classes, we need to handle them first.
+      if (const auto *cxxDecl = type->getAsCXXRecordDecl()) {
+        uint32_t baseIndex = 0;
+        for (auto base : cxxDecl->bases()) {
+          const auto baseType = typeTranslator.translateType(base.getType());
+          fields.push_back(theBuilder.createCompositeExtract(
+              baseType, subValues[baseIndex++], {arrayIndex}));
+        }
+      }
+
       // Extract the element at index arrayIndex from each field
       for (const auto *field : structDecl->fields()) {
         const uint32_t fieldType =
@@ -1497,11 +1554,9 @@ bool DeclResultIdMapper::createStageVars(const hlsl::SigPoint *sigPoint,
   return true;
 }
 
-bool DeclResultIdMapper::writeBackOutputStream(const ValueDecl *decl,
-                                               uint32_t value) {
+bool DeclResultIdMapper::writeBackOutputStream(const NamedDecl *decl,
+                                               QualType type, uint32_t value) {
   assert(shaderModel.IsGS()); // Only for GS use
-
-  QualType type = decl->getType();
 
   if (hlsl::IsHLSLStreamOutputType(type))
     type = hlsl::GetHLSLResourceResultType(type);
@@ -1524,7 +1579,9 @@ bool DeclResultIdMapper::writeBackOutputStream(const ValueDecl *decl,
 
     // Query the <result-id> for the stage output variable generated out
     // of this decl.
-    const auto found = stageVarIds.find(decl);
+    // We have semantic string attached to this decl; therefore, it must be a
+    // DeclaratorDecl.
+    const auto found = stageVarIds.find(cast<DeclaratorDecl>(decl));
 
     // We should have recorded its stage output variable previously.
     assert(found != stageVarIds.end());
@@ -1554,6 +1611,20 @@ bool DeclResultIdMapper::writeBackOutputStream(const ValueDecl *decl,
     return false;
   }
 
+  // If we have base classes, we need to handle them first.
+  if (const auto *cxxDecl = type->getAsCXXRecordDecl()) {
+    uint32_t baseIndex = 0;
+    for (auto base : cxxDecl->bases()) {
+      const auto baseType = typeTranslator.translateType(base.getType());
+      const auto subValue =
+          theBuilder.createCompositeExtract(baseType, value, {baseIndex++});
+
+      if (!writeBackOutputStream(base.getType()->getAsCXXRecordDecl(),
+                                 base.getType(), subValue))
+        return false;
+    }
+  }
+
   const auto *structDecl = type->getAs<RecordType>()->getDecl();
 
   // Write out each field
@@ -1562,7 +1633,7 @@ bool DeclResultIdMapper::writeBackOutputStream(const ValueDecl *decl,
     const uint32_t subValue = theBuilder.createCompositeExtract(
         fieldType, value, {getNumBaseClasses(type) + field->getFieldIndex()});
 
-    if (!writeBackOutputStream(field, subValue))
+    if (!writeBackOutputStream(field, field->getType(), subValue))
       return false;
   }
 
