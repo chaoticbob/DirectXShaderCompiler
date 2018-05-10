@@ -2334,7 +2334,7 @@ def warn_attribute_wrong_decl_type : Warning<
   "SubpassInput, SubpassInputMS|"
   // SPIRV Change Ends
   // HLSL Change Starts - add 3 more enum values
-  "varibales and parameters|functions, parameters, and fields|"
+  "variables and parameters|functions, parameters, and fields|"
   "functions, variables, parameters, fields, and types}1">,
   // HLSL Change Ends
   InGroup<IgnoredAttributes>;
@@ -7488,8 +7488,6 @@ def err_hlsl_objectintemplateargument : Error<
   "%0 is an object and cannot be used as a type parameter">;
 def err_hlsl_packoffset_requires_cbuffer : Error<
   "packoffset is only allowed in a constant buffer">;
-def err_hlsl_param_typedef_of_void : Error< // Patterned after err_param_typedef_of_void
-  "empty parameter list defined with a %select{typedef|type alias}0 of 'void' not allowed%select{ in HLSL|}0">;
 def err_hlsl_register_semantics_conflicting : Error<
   "conflicting register semantics">;
 def err_hlsl_register_or_offset_bind_not_valid: Error<
@@ -7512,12 +7510,16 @@ def err_hlsl_typeintemplateargument : Error<
   "%0 cannot be used as a type parameter">;
 def err_hlsl_typeintemplateargument_requires_scalar : Error<
   "%0 cannot be used as a type parameter where a scalar is required">;
+def err_hlsl_typeintemplateargument_requires_struct : Error<
+  "%0 cannot be used as a type parameter where a struct is required">;
 def err_hlsl_type_mismatch : Error<
   "type mismatch">;
 def err_hlsl_unsupported_array_equality_op: Error<
   "equality operators cannot be used with array types">;
 def err_hlsl_unsupported_array_size: Error<
   "array dimension must be between 1 and 65536">;
+def err_hlsl_unsupported_incomplete_array: Error<
+  "array dimensions of struct/class members must be explicit">;
 def err_hlsl_unsupported_bool_lvalue_op : Error<
   "operator cannot be used with a bool lvalue">;
 def err_hlsl_unsupported_lvalue_cast_op : Error<

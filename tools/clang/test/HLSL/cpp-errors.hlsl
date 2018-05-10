@@ -238,7 +238,7 @@ int fn_template(T t)
 
 int template; // expected-error {{'template' is a reserved keyword in HLSL}} expected-error {{expected unqualified-id}}
 
-int get_value(VOID_TYPE) { // expected-error {{empty parameter list defined with a typedef of 'void' not allowed in HLSL}}
+int get_value(VOID_TYPE) {
   return 1;
 }
 
@@ -596,7 +596,7 @@ void expressions()
     }
 
     int local_field_1 = 1;        // expected-error {{struct/class members cannot have default values}}
-    int local_field_2[] = { 1 };  // expected-error {{array bound cannot be deduced from an in-class initializer}} expected-error {{struct/class members cannot have default values}}
+    int local_field_2[] = { 1 };  // expected-error {{array dimensions of struct/class members must be explicit}} expected-error {{array bound cannot be deduced from an in-class initializer}} expected-error {{struct/class members cannot have default values}}
   };
 }
 

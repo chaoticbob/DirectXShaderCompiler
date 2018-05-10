@@ -28,6 +28,7 @@
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/SPIRV/EmitSPIRVOptions.h"
+#include "clang/SPIRV/FeatureManager.h"
 #include "clang/SPIRV/ModuleBuilder.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -45,7 +46,7 @@ namespace spirv {
 /// through the AST is done manually instead of using ASTConsumer's harness.
 class SPIRVEmitter : public ASTConsumer {
 public:
-  SPIRVEmitter(CompilerInstance &ci, const EmitSPIRVOptions &options);
+  SPIRVEmitter(CompilerInstance &ci, EmitSPIRVOptions &options);
 
   void HandleTranslationUnit(ASTContext &context) override;
 
@@ -99,7 +100,6 @@ private:
   SpirvEvalInfo doConditionalOperator(const ConditionalOperator *expr);
   SpirvEvalInfo doCXXMemberCallExpr(const CXXMemberCallExpr *expr);
   SpirvEvalInfo doCXXOperatorCallExpr(const CXXOperatorCallExpr *expr);
-  SpirvEvalInfo doDeclRefExpr(const DeclRefExpr *expr);
   SpirvEvalInfo doExtMatrixElementExpr(const ExtMatrixElementExpr *expr);
   SpirvEvalInfo doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr);
   SpirvEvalInfo doInitListExpr(const InitListExpr *expr);
@@ -130,6 +130,8 @@ private:
   /// taking consideration of the operand type.
   spv::Op translateOp(BinaryOperator::Opcode op, QualType type);
 
+  spv::Op translateWaveOp(hlsl::IntrinsicOp op, QualType type, SourceLocation);
+
   /// Generates SPIR-V instructions for the given normal (non-intrinsic and
   /// non-operator) standalone or member function call.
   SpirvEvalInfo processCall(const CallExpr *expr);
@@ -147,13 +149,26 @@ private:
   void storeValue(const SpirvEvalInfo &lhsPtr, const SpirvEvalInfo &rhsVal,
                   QualType lhsValType);
 
+  /// Decomposes and reconstructs the given srcVal of the given valType to meet
+  /// the requirements of the dstLR layout rule.
+  uint32_t reconstructValue(const SpirvEvalInfo &srcVal, QualType valType,
+                            LayoutRule dstLR);
+
   /// Generates the necessary instructions for conducting the given binary
-  /// operation on lhs and rhs. If lhsResultId is not nullptr, the evaluated
-  /// pointer from lhs during the process will be written into it. If
-  /// mandateGenOpcode is not spv::Op::Max, it will used as the SPIR-V opcode
-  /// instead of deducing from Clang frontend opcode.
+  /// operation on lhs and rhs.
+  ///
+  /// computationType is the type for LHS and RHS when doing computation, while
+  /// resultType is the type of the whole binary operation. They can be
+  /// different for compound assignments like <some-int-value> *=
+  /// <some-float-value>, where computationType is float and resultType is int.
+  ///
+  /// If lhsResultId is not nullptr, the evaluated pointer from lhs during the
+  /// process will be written into it. If mandateGenOpcode is not spv::Op::Max,
+  /// it will used as the SPIR-V opcode instead of deducing from Clang frontend
+  /// opcode.
   SpirvEvalInfo processBinaryOp(const Expr *lhs, const Expr *rhs,
-                                BinaryOperatorKind opcode, QualType resultType,
+                                BinaryOperatorKind opcode,
+                                QualType computationType, QualType resultType,
                                 SourceRange, SpirvEvalInfo *lhsInfo = nullptr,
                                 spv::Op mandateGenOpcode = spv::Op::Max);
 
@@ -257,9 +272,8 @@ private:
   /// Creates a temporary local variable in the current function of the given
   /// varType and varName. Initializes the variable with the given initValue.
   /// Returns the <result-id> of the variable.
-  uint32_t SPIRVEmitter::createTemporaryVar(QualType varType,
-                                            llvm::StringRef varName,
-                                            const SpirvEvalInfo &initValue);
+  uint32_t createTemporaryVar(QualType varType, llvm::StringRef varName,
+                              const SpirvEvalInfo &initValue);
 
   /// Collects all indices (SPIR-V constant values) from consecutive MemberExprs
   /// or ArraySubscriptExprs or operator[] calls and writes into indices.
@@ -283,6 +297,14 @@ private:
   bool validateVKAttributes(const NamedDecl *decl);
 
 private:
+  /// Converts the given value from the bitwidth of 'fromType' to the bitwidth
+  /// of 'toType'. If the two have the same bitwidth, returns the value itself.
+  /// If resultType is not nullptr, the resulting value's type will be written
+  /// to resultType. Panics if the given types are not scalar or vector of
+  /// float/integer type.
+  uint32_t convertBitwidth(uint32_t value, QualType fromType, QualType toType,
+                           uint32_t *resultType = nullptr);
+
   /// Processes the given expr, casts the result into the given bool (vector)
   /// type and returns the <result-id> of the casted value.
   uint32_t castToBool(uint32_t value, QualType fromType, QualType toType);
@@ -432,6 +454,24 @@ private:
   /// Processes Interlocked* intrinsic functions.
   uint32_t processIntrinsicInterlockedMethod(const CallExpr *,
                                              hlsl::IntrinsicOp);
+  /// Processes SM6.0 wave query intrinsic calls.
+  uint32_t processWaveQuery(const CallExpr *, spv::Op opcode);
+
+  /// Processes SM6.0 wave vote intrinsic calls.
+  uint32_t processWaveVote(const CallExpr *, spv::Op opcode);
+
+  /// Processes SM6.0 wave reduction or scan/prefix intrinsic calls.
+  uint32_t processWaveReductionOrPrefix(const CallExpr *, spv::Op op,
+                                        spv::GroupOperation groupOp);
+
+  /// Processes SM6.0 wave broadcast intrinsic calls.
+  uint32_t processWaveBroadcast(const CallExpr *);
+
+  /// Processes SM6.0 quad-wide shuffle.
+  uint32_t processWaveQuadWideShuffle(const CallExpr *, hlsl::IntrinsicOp op);
+
+  /// Processes the NonUniformResourceIndex intrinsic function.
+  SpirvEvalInfo processIntrinsicNonUniformResourceIndex(const CallExpr *);
 
 private:
   /// Returns the <result-id> for constant value 0 of the given type.
@@ -456,6 +496,11 @@ private:
   /// vector of size M or N; if a MxN matrix is given, the returned value
   /// one will be a vector of size N.
   uint32_t getMatElemValueOne(QualType type);
+
+  /// Returns a SPIR-V constant equal to the bitwdith of the given type minus
+  /// one. The returned constant has the same component count and bitwidth as
+  /// the given type.
+  uint32_t getMaskForBitwidthValue(QualType type);
 
 private:
   /// \brief Performs a FlatConversion implicit cast. Fills an instance of the
@@ -810,8 +855,8 @@ private:
   /// return a vec4. As a result, an extra processing step is necessary.
   uint32_t createImageSample(QualType retType, uint32_t imageType,
                              uint32_t image, uint32_t sampler,
-                             uint32_t coordinate, uint32_t compareVal,
-                             uint32_t bias, uint32_t lod,
+                             bool isNonUniform, uint32_t coordinate,
+                             uint32_t compareVal, uint32_t bias, uint32_t lod,
                              std::pair<uint32_t, uint32_t> grad,
                              uint32_t constOffset, uint32_t varOffset,
                              uint32_t constOffsets, uint32_t sample,
@@ -860,7 +905,7 @@ private:
   ASTContext &astContext;
   DiagnosticsEngine &diags;
 
-  EmitSPIRVOptions spirvOptions;
+  const EmitSPIRVOptions &spirvOptions;
 
   /// Entry function name and shader stage. Both of them are derived from the
   /// command line and should be const.
@@ -868,9 +913,10 @@ private:
   const hlsl::ShaderModel &shaderModel;
 
   SPIRVContext theContext;
+  FeatureManager featureManager;
   ModuleBuilder theBuilder;
-  DeclResultIdMapper declIdMapper;
   TypeTranslator typeTranslator;
+  DeclResultIdMapper declIdMapper;
 
   /// A queue of decls reachable from the entry function. Decls inserted into
   /// this queue will persist to avoid duplicated translations. And we'd like
@@ -893,6 +939,13 @@ private:
   /// Indicates whether the current emitter is in specialization constant mode:
   /// all 32-bit scalar constants will be translated into OpSpecConstant.
   bool isSpecConstantMode;
+
+  /// Indicates that we have found a NonUniformResourceIndex call when
+  /// traversing.
+  /// This field is used to convery information in a bottom-up manner; if we
+  /// have something like `aResource[NonUniformResourceIndex(aIndex)]`, we need
+  /// to attach `aResource` with proper decorations.
+  bool foundNonUniformResourceIndex;
 
   /// Whether the translated SPIR-V binary needs legalization.
   ///

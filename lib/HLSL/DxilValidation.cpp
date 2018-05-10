@@ -11,7 +11,7 @@
 
 #include "dxc/HLSL/DxilValidation.h"
 #include "dxc/HLSL/DxilGenerationPass.h"
-#include "dxc/HLSL/DXILOperations.h"
+#include "dxc/HLSL/DxilOperations.h"
 #include "dxc/HLSL/DxilModule.h"
 #include "dxc/HLSL/DxilShaderModel.h"
 #include "dxc/HLSL/DxilContainer.h"
@@ -282,7 +282,7 @@ public:
     : DiagnosticInfo(DK_FirstPluginKind, DiagnosticSeverity::DS_Error),
     m_message(str) { }
 
-  __override void print(DiagnosticPrinter &DP) const {
+  void print(DiagnosticPrinter &DP) const override {
     DP << m_message;
   }
 };

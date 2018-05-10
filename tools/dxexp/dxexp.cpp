@@ -13,7 +13,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 
-#include <Windows.h>
+#include <windows.h>
 #include <dxgi1_4.h>
 #include <d3d12.h>
 #include <atlbase.h>
@@ -76,6 +76,10 @@ typedef struct D3D12_FEATURE_DATA_D3D12_OPTIONS3
   _Out_  D3D12_VIEW_INSTANCING_TIER ViewInstancingTier;
   _Out_  BOOL BarycentricsSupported;
 } 	D3D12_FEATURE_DATA_D3D12_OPTIONS3;
+#endif
+
+#ifndef NTDDI_WIN10_RS3
+#define NTDDI_WIN10_RS3 0x0A000004  
 #endif
 
 #if WDK_NTDDI_VERSION <= NTDDI_WIN10_RS3

@@ -561,9 +561,9 @@ public:
     return S_OK;
   }
 
-  __override HRESULT STDMETHODCALLTYPE
+  HRESULT STDMETHODCALLTYPE
   LoadSource(_In_ LPCWSTR pFilename,
-             _COM_Outptr_result_maybenull_ IDxcBlob **ppIncludeSource) {
+             _COM_Outptr_result_maybenull_ IDxcBlob **ppIncludeSource) override {
     try {
       *ppIncludeSource = includeFiles.at(std::wstring(pFilename));
       (*ppIncludeSource)->AddRef();
@@ -789,7 +789,7 @@ int DxcBatchContext::BatchCompile(bool bMultiThread, bool bLibLink) {
   llvm::StringRef source((char *)pSource->GetBufferPointer(),
                          pSource->GetBufferSize());
   llvm::SmallVector<llvm::StringRef, 4> commands;
-  source.split(commands, "\r\n");
+  source.split(commands, "\n");
 
   if (bMultiThread) {
     unsigned int threadNum = std::min<unsigned>(
@@ -800,7 +800,8 @@ int DxcBatchContext::BatchCompile(bool bMultiThread, bool bLibLink) {
       threads[i] = std::thread(empty_fn);
 
     for (unsigned i = 0; i < commands.size(); i++) {
-      llvm::StringRef command = commands[i];
+      // trim to remove /r if exist.
+      llvm::StringRef command = commands[i].trim();
       if (command.empty())
         continue;
       if (command.startswith("//"))

@@ -5,10 +5,16 @@ struct S {
     float3 f2;
 };
 
+// CHECK-NOT: OpDecorate %a DescriptorSet
+// CHECK-NOT: OpDecorate %b DescriptorSet
+// CHECK-NOT: OpDecorate %c DescriptorSet
+// CHECK-NOT: OpDecorate %d DescriptorSet
+// CHECK-NOT: OpDecorate %s DescriptorSet
+
 // CHECK: %a = OpVariable %_ptr_Workgroup_float Workgroup
 groupshared              float    a;
 // CHECK: %b = OpVariable %_ptr_Workgroup_v3float Workgroup
-groupshared              float3   b;
+static groupshared       float3   b;  // Ignore static modifier
 // CHECK: %c = OpVariable %_ptr_Workgroup_mat2v3float Workgroup
 groupshared column_major float2x3 c;
 // CHECK: %d = OpVariable %_ptr_Workgroup__arr_v2float_uint_5 Workgroup
@@ -17,7 +23,7 @@ groupshared              float2   d[5];
 groupshared              S        s;
 
 [numthreads(8, 8, 8)]
-void main(uint2 tid : SV_DispatchThreadID, uint2 gid : SV_GroupID) {
+void main(uint3 tid : SV_DispatchThreadID, uint2 gid : SV_GroupID) {
 // Make sure pointers have the correct storage class
 // CHECK:    {{%\d+}} = OpAccessChain %_ptr_Workgroup_float %s %int_0
 // CHECK: [[d0:%\d+]] = OpAccessChain %_ptr_Workgroup_v2float %d %int_0

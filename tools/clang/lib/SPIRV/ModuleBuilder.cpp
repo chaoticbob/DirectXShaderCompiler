@@ -13,17 +13,22 @@
 #include "spirv/unified1//spirv.hpp11"
 #include "clang/SPIRV/BitwiseCast.h"
 #include "clang/SPIRV/InstBuilder.h"
-#include "llvm/llvm_assert/assert.h"
 
 namespace clang {
 namespace spirv {
 
-ModuleBuilder::ModuleBuilder(SPIRVContext *C)
-    : theContext(*C), theModule(), theFunction(nullptr), insertPoint(nullptr),
+ModuleBuilder::ModuleBuilder(SPIRVContext *C, FeatureManager *features,
+                             bool reflect)
+    : theContext(*C), featureManager(features), allowReflect(reflect),
+      theModule(), theFunction(nullptr), insertPoint(nullptr),
       instBuilder(nullptr), glslExtSetId(0) {
   instBuilder.setConsumer([this](std::vector<uint32_t> &&words) {
     this->constructSite = std::move(words);
   });
+
+  // Set the SPIR-V version if needed.
+  if (featureManager && featureManager->getTargetEnv() == SPV_ENV_VULKAN_1_1)
+    theModule.setVersion(0x00010300);
 }
 
 std::vector<uint32_t> ModuleBuilder::takeModule() {
@@ -247,6 +252,42 @@ uint32_t ModuleBuilder::createSpecConstantBinaryOp(spv::Op op,
   return id;
 }
 
+uint32_t ModuleBuilder::createGroupNonUniformOp(spv::Op op, uint32_t resultType,
+                                                uint32_t execScope) {
+  assert(insertPoint && "null insert point");
+  const uint32_t id = theContext.takeNextId();
+  instBuilder.groupNonUniformOp(op, resultType, id, execScope).x();
+  insertPoint->appendInstruction(std::move(constructSite));
+  return id;
+}
+
+uint32_t ModuleBuilder::createGroupNonUniformUnaryOp(
+    spv::Op op, uint32_t resultType, uint32_t execScope, uint32_t operand,
+    llvm::Optional<spv::GroupOperation> groupOp) {
+  assert(insertPoint && "null insert point");
+  const uint32_t id = theContext.takeNextId();
+  instBuilder
+      .groupNonUniformUnaryOp(op, resultType, id, execScope, groupOp, operand)
+      .x();
+  insertPoint->appendInstruction(std::move(constructSite));
+  return id;
+}
+
+uint32_t ModuleBuilder::createGroupNonUniformBinaryOp(spv::Op op,
+                                                      uint32_t resultType,
+                                                      uint32_t execScope,
+                                                      uint32_t operand1,
+                                                      uint32_t operand2) {
+  assert(insertPoint && "null insert point");
+  const uint32_t id = theContext.takeNextId();
+  instBuilder
+      .groupNonUniformBinaryOp(op, resultType, id, execScope, operand1,
+                               operand2)
+      .x();
+  insertPoint->appendInstruction(std::move(constructSite));
+  return id;
+}
+
 uint32_t ModuleBuilder::createAtomicOp(spv::Op opcode, uint32_t resultType,
                                        uint32_t orignalValuePtr,
                                        uint32_t scopeId,
@@ -400,8 +441,8 @@ uint32_t ModuleBuilder::createImageTexelPointer(uint32_t resultType,
 
 uint32_t ModuleBuilder::createImageSample(
     uint32_t texelType, uint32_t imageType, uint32_t image, uint32_t sampler,
-    uint32_t coordinate, uint32_t compareVal, uint32_t bias, uint32_t lod,
-    std::pair<uint32_t, uint32_t> grad, uint32_t constOffset,
+    bool isNonUniform, uint32_t coordinate, uint32_t compareVal, uint32_t bias,
+    uint32_t lod, std::pair<uint32_t, uint32_t> grad, uint32_t constOffset,
     uint32_t varOffset, uint32_t constOffsets, uint32_t sample, uint32_t minLod,
     uint32_t residencyCodeId) {
   assert(insertPoint && "null insert point");
@@ -427,6 +468,12 @@ uint32_t ModuleBuilder::createImageSample(
   const uint32_t sampledImgTy = getSampledImageType(imageType);
   instBuilder.opSampledImage(sampledImgTy, sampledImgId, image, sampler).x();
   insertPoint->appendInstruction(std::move(constructSite));
+
+  if (isNonUniform) {
+    // The sampled image will be used to access resource's memory, so we need
+    // to decorate it with NonUniformEXT.
+    decorate(sampledImgId, spv::Decoration::NonUniformEXT);
+  }
 
   uint32_t texelId = theContext.takeNextId();
   llvm::SmallVector<uint32_t, 4> params;
@@ -508,9 +555,9 @@ uint32_t ModuleBuilder::createImageFetchOrRead(
 
 uint32_t ModuleBuilder::createImageGather(
     uint32_t texelType, uint32_t imageType, uint32_t image, uint32_t sampler,
-    uint32_t coordinate, uint32_t component, uint32_t compareVal,
-    uint32_t constOffset, uint32_t varOffset, uint32_t constOffsets,
-    uint32_t sample, uint32_t residencyCodeId) {
+    bool isNonUniform, uint32_t coordinate, uint32_t component,
+    uint32_t compareVal, uint32_t constOffset, uint32_t varOffset,
+    uint32_t constOffsets, uint32_t sample, uint32_t residencyCodeId) {
   assert(insertPoint && "null insert point");
 
   uint32_t sparseRetType = 0;
@@ -524,6 +571,12 @@ uint32_t ModuleBuilder::createImageGather(
   const uint32_t sampledImgTy = getSampledImageType(imageType);
   instBuilder.opSampledImage(sampledImgTy, sampledImgId, image, sampler).x();
   insertPoint->appendInstruction(std::move(constructSite));
+
+  if (isNonUniform) {
+    // The sampled image will be used to access resource's memory, so we need
+    // to decorate it with NonUniformEXT.
+    decorate(sampledImgId, spv::Decoration::NonUniformEXT);
+  }
 
   llvm::SmallVector<uint32_t, 2> params;
 
@@ -716,6 +769,16 @@ void ModuleBuilder::addExecutionMode(uint32_t entryPointId,
   theModule.addExecutionMode(std::move(constructSite));
 }
 
+void ModuleBuilder::addExtension(Extension ext, llvm::StringRef target,
+                                 SourceLocation srcLoc) {
+  assert(featureManager);
+  featureManager->requestExtension(ext, target, srcLoc);
+  // Do not emit OpExtension if the given extension is natively supported in the
+  // target environment.
+  if (featureManager->isExtensionRequiredForTargetEnv(ext))
+    theModule.addExtension(featureManager->getExtensionName(ext));
+}
+
 uint32_t ModuleBuilder::getGLSLExtInstSet() {
   if (glslExtSetId == 0) {
     glslExtSetId = theContext.takeNextId();
@@ -771,15 +834,44 @@ void ModuleBuilder::decorateDSetBinding(uint32_t targetId, uint32_t setNumber,
   d = Decoration::getBinding(theContext, bindingNumber);
   theModule.addDecoration(d, targetId);
 }
+
 void ModuleBuilder::decorateInputAttachmentIndex(uint32_t targetId,
                                                  uint32_t indexNumber) {
   const auto *d = Decoration::getInputAttachmentIndex(theContext, indexNumber);
   theModule.addDecoration(d, targetId);
 }
 
+void ModuleBuilder::decorateCounterBufferId(uint32_t mainBufferId,
+                                            uint32_t counterBufferId) {
+  if (allowReflect) {
+    addExtension(Extension::GOOGLE_hlsl_functionality1, "SPIR-V reflection",
+                 {});
+    theModule.addDecoration(
+        Decoration::getHlslCounterBufferGOOGLE(theContext, counterBufferId),
+        mainBufferId);
+  }
+}
+
+void ModuleBuilder::decorateHlslSemantic(uint32_t targetId,
+                                         llvm::StringRef semantic,
+                                         llvm::Optional<uint32_t> memberIdx) {
+  if (allowReflect) {
+    addExtension(Extension::GOOGLE_hlsl_functionality1, "SPIR-V reflection",
+                 {});
+    theModule.addDecoration(
+        Decoration::getHlslSemanticGOOGLE(theContext, semantic, memberIdx),
+        targetId);
+  }
+}
+
 void ModuleBuilder::decorateLocation(uint32_t targetId, uint32_t location) {
   const Decoration *d =
       Decoration::getLocation(theContext, location, llvm::None);
+  theModule.addDecoration(d, targetId);
+}
+
+void ModuleBuilder::decorateIndex(uint32_t targetId, uint32_t index) {
+  const Decoration *d = Decoration::getIndex(theContext, index);
   theModule.addDecoration(d, targetId);
 }
 
@@ -812,6 +904,9 @@ void ModuleBuilder::decorate(uint32_t targetId, spv::Decoration decoration) {
   case spv::Decoration::Patch:
     d = Decoration::getPatch(theContext);
     break;
+  case spv::Decoration::NonUniformEXT:
+    d = Decoration::getNonUniformEXT(theContext);
+    break;
   }
 
   assert(d && "unimplemented decoration");
@@ -835,12 +930,17 @@ IMPL_GET_PRIMITIVE_TYPE(Float32)
 
 #undef IMPL_GET_PRIMITIVE_TYPE
 
+// Note: At the moment, Float16 capability should not be added for Vulkan 1.0.
+// It is not a required capability, and adding the SPV_AMD_gpu_half_float does
+// not enable this capability. Any driver that supports float16 in Vulkan 1.0
+// should accept this extension.
 #define IMPL_GET_PRIMITIVE_TYPE_WITH_CAPABILITY(ty, cap)                       \
                                                                                \
   uint32_t ModuleBuilder::get##ty##Type() {                                    \
-    requireCapability(spv::Capability::cap);                                   \
     if (spv::Capability::cap == spv::Capability::Float16)                      \
-      theModule.addExtension("SPV_AMD_gpu_shader_half_float");                 \
+      addExtension(Extension::AMD_gpu_shader_half_float, "16-bit float", {});  \
+    else                                                                       \
+      requireCapability(spv::Capability::cap);                                 \
     const Type *type = Type::get##ty(theContext);                              \
     const uint32_t typeId = theContext.getResultIdForType(type);               \
     theModule.addType(type, typeId);                                           \
@@ -881,7 +981,8 @@ uint32_t ModuleBuilder::getVecType(uint32_t elemType, uint32_t elemCount) {
 }
 
 uint32_t ModuleBuilder::getMatType(QualType elemType, uint32_t colType,
-                                   uint32_t colCount) {
+                                   uint32_t colCount,
+                                   Type::DecorationSet decorations) {
   // NOTE: According to Item "Data rules" of SPIR-V Spec 2.16.1 "Universal
   // Validation Rules":
   //   Matrix types can only be parameterized with floating-point types.
@@ -889,7 +990,7 @@ uint32_t ModuleBuilder::getMatType(QualType elemType, uint32_t colType,
   // So we need special handling of non-fp matrices. We emulate non-fp
   // matrices as an array of vectors.
   if (!elemType->isFloatingType())
-    return getArrayType(colType, getConstantUint32(colCount));
+    return getArrayType(colType, getConstantUint32(colCount), decorations);
 
   const Type *type = Type::getMatrix(theContext, colType, colCount);
   const uint32_t typeId = theContext.getResultIdForType(type);

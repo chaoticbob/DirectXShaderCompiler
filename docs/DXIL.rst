@@ -1716,17 +1716,17 @@ Valid resource type   # of active coordinates
 ====================  =====================================================
 
 RawBufferLoad
-~~~~~~~~~~
+~~~~~~~~~~~~~
 
 The following signature shows the operation syntax::
 
-  ; overloads: SM5.1: f32|i32,  SM6.0: f32|i32
+  ; overloads: SM5.1: f32|i32,  SM6.0: f32|i32, SM6.2: f16|f32|i16|i32
   ; returns: status
   declare %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(
       i32,                  ; opcode
       %dx.types.Handle,     ; resource handle
-      i32,                  ; coordinate c0
-      i32,                  ; coordinate c1
+      i32,                  ; coordinate c0 (index)
+      i32,                  ; coordinate c1 (elementOffset)
       i8,                   ; mask
       i32,                  ; alignment
   )
@@ -1768,6 +1768,35 @@ RWTypedBuffer       1 (c0 in elements)
 RWRawBuffer         1 (c0 in bytes)
 RWStructuredBuffer  2 (c0 in elements, c1 = byte offset into the element)
 =================== =====================================================
+
+RawBufferStore
+~~~~~~~~~~~~~~
+
+The following signature shows the operation syntax::
+
+  ; overloads: SM5.1: f32|i32,  SM6.0: f32|i32, SM6.2: f16|f32|i16|i32
+  declare void @dx.op.bufferStore.f32(
+      i32,                  ; opcode
+      %dx.types.Handle,     ; resource handle
+      i32,                  ; coordinate c0 (index)
+      i32,                  ; coordinate c1 (elementOffset)
+      float,                ; value v0
+      float,                ; value v1
+      float,                ; value v2
+      float,                ; value v3
+      i8,                   ; write mask
+      i32)                  ; alignment
+
+The call respects SM5.1 OOB and alignment rules.
+
+The write mask indicates which components are written (x - 1, y - 2, z - 4, w - 8), similar to DXBC. For RWTypedBuffer, the mask must cover all resource components. For RWRawBuffer and RWStructuredBuffer, valid masks are: x, xy, xyz, xyzw.
+
+==================== =====================================================
+Valid resource type  # of active coordinates
+==================== =====================================================
+RWRawbuffer          1 (c0 in bytes)
+RWStructuredbuffer   2 (c0 in elements, c1 = byte offset into the element)
+==================== =====================================================
 
 BufferUpdateCounter
 ~~~~~~~~~~~~~~~~~~~
@@ -1979,6 +2008,67 @@ Select        selects an instruction
 ExtractValue  extracts from aggregate
 ============= ======================================================================= =================
 
+
+FAdd
+~~~~
+
+%des = fadd float %src0, %src1
+
+The following table shows the results obtained when executing the instruction with various classes of numbers, assuming that "fp32-denorm-mode"="preserve".
+For "fp32-denorm-mode"="ftz" mode, denorms inputs should be treated as corresponding signed zero, and any resulting denorm is also flushed to zero.
+
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| src0\src1| -inf     | -F     | -denorm  | -0 | +0 | +denorm   |    +F  | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| -inf     | -inf     |   -inf | -inf     |-inf|-inf| -inf      |   -inf | NaN  | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| -F       | -inf     |   -F   | -F       |src0|src0| -F        |   +/-F | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| -denorm  | -inf     |   -F   |-F/denorm |src0|src0| +/-denorm |   +F   | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| -0       | -inf     |   src1 | src1     |-0  |+0  | src1      |   src1 | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| +0       | -inf     |   src1 | src1     |-0  |+0  | src1      |   src1 | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| +denorm  | -inf     |   -F   |+/-denorm |src0|src0| +F/denorm |   +F   | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| +F       | -inf     |  +/-F  | +F       |src0|src0| +F        |   +F   | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| +inf     | NaN      |   +inf | +inf     |+inf|+inf| +inf      |   +inf | +inf | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+| NaN      | NaN      |   NaN  | NaN      |NaN |NaN | NaN       |   NaN  | NaN  | NaN |
++----------+----------+--------+----------+----+----+-----------+--------+------+-----+
+
+FDiv
+~~~~
+
+%dest = fdiv float %src0, %src1
+
+The following table shows the results obtained when executing the instruction with various classes of numbers, assuming that fast math flag is not used and "fp32-denorm-mode"="preserve".
+When "fp32-denorm-mode"="ftz", denorm inputs should be interpreted as corresponding signed zero, and any resulting denorm is also flushed to zero.
+When fast math is enabled, implementation may use reciprocal form: src0*(1/src1).  This may result in evaluating src0*(+/-)INF from src0*(1/(+/-)denorm).  This may produce NaN in some cases or (+/-)INF in others.
+
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| src0\\src1| -inf     | -F     |  -1   | -denorm | -0 | +0 | +denorm |  +1   |    +F  | +inf | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| -inf      | NaN      |   +inf | +inf  | +inf    |+inf|-inf| -inf    |  -inf |   -inf | NaN  | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| -F        | +0       |   +F   | -src0 | +F      |+inf|-inf| -F      |  src0 |   -F   | -0   | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| -denorm   | +0       | +denorm| -src0 | +F      |+inf|-inf| -F      |  src0 |-denorm | -0   | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| -0        | +0       |   +0   | +0    | 0       |NaN |NaN | 0       |  -0   |   -0   | -0   | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| +0        | -0       |   -0   | -0    | 0       |NaN |NaN | 0       |  +0   |   +0   | +0   | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| +denorm   | -0       | -denorm| -src0 | -F      |-inf|+inf| +F      |  src0 |+denorm | +0   | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| +F        | -0       |   -F   | -src0 | -F      |-inf|+inf| +F      |  src0 |   +F   | +0   | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| +inf      | NaN      |   -inf | -inf  | -inf    |-inf|+inf| +inf    |  +inf |   +inf | NaN  | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
+| NaN       | NaN      |   NaN  | NaN   | NaN     |NaN |NaN | NaN     |  NaN  |   NaN  | NaN  | NaN |
++-----------+----------+--------+-------+---------+----+----+---------+-------+--------+------+-----+
 
 .. INSTR-RST:END
 

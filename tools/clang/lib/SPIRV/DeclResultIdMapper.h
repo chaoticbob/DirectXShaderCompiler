@@ -19,6 +19,7 @@
 #include "spirv/unified1/spirv.hpp11"
 #include "clang/AST/Attr.h"
 #include "clang/SPIRV/EmitSPIRVOptions.h"
+#include "clang/SPIRV/FeatureManager.h"
 #include "clang/SPIRV/ModuleBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Optional.h"
@@ -31,23 +32,38 @@
 namespace clang {
 namespace spirv {
 
+/// A struct containing information about a particular HLSL semantic.
+struct SemanticInfo {
+  llvm::StringRef str;            ///< The original semantic string
+  const hlsl::Semantic *semantic; ///< The unique semantic object
+  llvm::StringRef name;           ///< The semantic string without index
+  uint32_t index;                 ///< The semantic index
+  SourceLocation loc;             ///< Source code location
+
+  bool isValid() const { return semantic != nullptr; }
+
+  inline hlsl::Semantic::Kind getKind() const;
+  /// \brief Returns true if this semantic is a SV_Target.
+  inline bool isTarget() const;
+};
+
 /// \brief The class containing HLSL and SPIR-V information about a Vulkan stage
 /// (builtin/input/output) variable.
 class StageVar {
 public:
-  inline StageVar(const hlsl::SigPoint *sig, llvm::StringRef semaStr,
-                  const hlsl::Semantic *sema, llvm::StringRef semaName,
-                  uint32_t semaIndex, const VKBuiltInAttr *builtin,
-                  uint32_t type)
-      : sigPoint(sig), semanticStr(semaStr), semantic(sema),
-        semanticName(semaName), semanticIndex(semaIndex), builtinAttr(builtin),
+  inline StageVar(const hlsl::SigPoint *sig, SemanticInfo semaInfo,
+                  const VKBuiltInAttr *builtin, uint32_t type,
+                  uint32_t locCount)
+      : sigPoint(sig), semanticInfo(std::move(semaInfo)), builtinAttr(builtin),
         typeId(type), valueId(0), isBuiltin(false),
-        storageClass(spv::StorageClass::Max), location(nullptr) {
+        storageClass(spv::StorageClass::Max), location(nullptr),
+        locationCount(locCount) {
     isBuiltin = builtinAttr != nullptr;
   }
 
   const hlsl::SigPoint *getSigPoint() const { return sigPoint; }
-  const hlsl::Semantic *getSemantic() const { return semantic; }
+  const SemanticInfo &getSemanticInfo() const { return semanticInfo; }
+  std::string getSemanticStr() const;
 
   uint32_t getSpirvTypeId() const { return typeId; }
 
@@ -55,9 +71,6 @@ public:
   void setSpirvId(uint32_t id) { valueId = id; }
 
   const VKBuiltInAttr *getBuiltInAttr() const { return builtinAttr; }
-
-  std::string getSemanticStr() const;
-  uint32_t getSemanticIndex() const { return semanticIndex; }
 
   bool isSpirvBuitin() const { return isBuiltin; }
   void setIsSpirvBuiltin() { isBuiltin = true; }
@@ -68,18 +81,17 @@ public:
   const VKLocationAttr *getLocationAttr() const { return location; }
   void setLocationAttr(const VKLocationAttr *loc) { location = loc; }
 
+  const VKIndexAttr *getIndexAttr() const { return indexAttr; }
+  void setIndexAttr(const VKIndexAttr *idx) { indexAttr = idx; }
+
+  uint32_t getLocationCount() const { return locationCount; }
+
 private:
   /// HLSL SigPoint. It uniquely identifies each set of parameters that may be
   /// input or output for each entry point.
   const hlsl::SigPoint *sigPoint;
-  /// Original HLSL semantic string in the source code.
-  llvm::StringRef semanticStr;
-  /// HLSL semantic.
-  const hlsl::Semantic *semantic;
-  /// Original HLSL semantic string (without index) in the source code.
-  llvm::StringRef semanticName;
-  /// HLSL semantic index.
-  uint32_t semanticIndex;
+  /// Information about HLSL semantic string.
+  SemanticInfo semanticInfo;
   /// SPIR-V BuiltIn attribute.
   const VKBuiltInAttr *builtinAttr;
   /// SPIR-V <type-id>.
@@ -92,39 +104,30 @@ private:
   spv::StorageClass storageClass;
   /// Location assignment if input/output variable.
   const VKLocationAttr *location;
+  /// Index assignment if PS output variable
+  const VKIndexAttr *indexAttr;
+  /// How many locations this stage variable takes.
+  uint32_t locationCount;
 };
 
 class ResourceVar {
 public:
-  /// The category of this resource.
-  ///
-  /// We only care about Vulkan image and sampler types here, since they can be
-  /// bundled together as a combined image sampler which takes the same binding
-  /// number. The compiler should allow this case.
-  ///
-  /// Numbers are assigned to make bit check easiser.
-  enum class Category : uint32_t {
-    Image = 1,
-    Sampler = 2,
-    Other = 3,
-  };
-
-  ResourceVar(uint32_t id, Category cat, const hlsl::RegisterAssignment *r,
+  ResourceVar(uint32_t id, const hlsl::RegisterAssignment *r,
               const VKBindingAttr *b, const VKCounterBindingAttr *cb,
               bool counter = false)
-      : varId(id), category(cat), reg(r), binding(b), counterBinding(cb),
+      : varId(id), reg(r), binding(b), counterBinding(cb),
         isCounterVar(counter) {}
 
   uint32_t getSpirvId() const { return varId; }
-  Category getCategory() const { return category; }
   const hlsl::RegisterAssignment *getRegister() const { return reg; }
   const VKBindingAttr *getBinding() const { return binding; }
   bool isCounter() const { return isCounterVar; }
-  const auto *getCounterBinding() const { return counterBinding; }
+  const VKCounterBindingAttr *getCounterBinding() const {
+    return counterBinding;
+  }
 
 private:
   uint32_t varId;                             ///< <result-id>
-  Category category;                          ///< Resource category
   const hlsl::RegisterAssignment *reg;        ///< HLSL register assignment
   const VKBindingAttr *binding;               ///< Vulkan binding assignment
   const VKCounterBindingAttr *counterBinding; ///< Vulkan counter binding
@@ -252,7 +255,8 @@ private:
 class DeclResultIdMapper {
 public:
   inline DeclResultIdMapper(const hlsl::ShaderModel &stage, ASTContext &context,
-                            ModuleBuilder &builder,
+                            ModuleBuilder &builder, TypeTranslator &translator,
+                            FeatureManager &features,
                             const EmitSPIRVOptions &spirvOptions);
 
   /// \brief Returns the <result-id> for a SPIR-V builtin variable.
@@ -294,13 +298,14 @@ public:
 
   /// \brief Creates a function-scope variable in the current function and
   /// returns its <result-id>.
-  uint32_t createFnVar(const VarDecl *var, llvm::Optional<uint32_t> init);
+  SpirvEvalInfo createFnVar(const VarDecl *var, llvm::Optional<uint32_t> init);
 
   /// \brief Creates a file-scope variable and returns its <result-id>.
-  uint32_t createFileVar(const VarDecl *var, llvm::Optional<uint32_t> init);
+  SpirvEvalInfo createFileVar(const VarDecl *var,
+                              llvm::Optional<uint32_t> init);
 
   /// \brief Creates an external-visible variable and returns its <result-id>.
-  uint32_t createExternVar(const VarDecl *var);
+  SpirvEvalInfo createExternVar(const VarDecl *var);
 
   /// \brief Creates a cbuffer/tbuffer from the given decl.
   ///
@@ -326,6 +331,9 @@ public:
   /// \brief Creates a PushConstant block from the given decl.
   uint32_t createPushConstant(const VarDecl *decl);
 
+  /// \brief Creates the $Globals cbuffer.
+  void createGlobalsCBuffer(const VarDecl *var);
+
   /// \brief Returns the suitable type for the given decl, considering the
   /// given decl could possibly be created as an alias variable. If true, a
   /// pointer-to-the-value type will be returned, otherwise, just return the
@@ -350,8 +358,8 @@ private:
     /// Default constructor to satisfy DenseMap
     DeclSpirvInfo() : info(0), indexInCTBuffer(-1) {}
 
-    DeclSpirvInfo(const SpirvEvalInfo &info_, int index = -1, bool row = false)
-        : info(info_), indexInCTBuffer(index), isRowMajor(row) {}
+    DeclSpirvInfo(const SpirvEvalInfo &info_, int index = -1)
+        : info(info_), indexInCTBuffer(index) {}
 
     /// Implicit conversion to SpirvEvalInfo.
     operator SpirvEvalInfo() const { return info; }
@@ -360,8 +368,6 @@ private:
     /// Value >= 0 means that this decl is a VarDecl inside a cbuffer/tbuffer
     /// and this is the index; value < 0 means this is just a standalone decl.
     int indexInCTBuffer;
-    /// Whether this decl should be row major.
-    bool isRowMajor;
   };
 
   /// \brief Returns the SPIR-V information for the given decl.
@@ -369,13 +375,10 @@ private:
   const DeclSpirvInfo *getDeclSpirvInfo(const ValueDecl *decl) const;
 
 public:
-  /// \brief Returns the information for the given decl. If the decl is not
-  /// registered previously, return an invalid SpirvEvalInfo.
+  /// \brief Returns the information for the given decl.
   ///
-  /// This method will emit a fatal error if checkRegistered is true and the
-  /// decl is not registered.
-  SpirvEvalInfo getDeclEvalInfo(const ValueDecl *decl,
-                                bool checkRegistered = true);
+  /// This method will panic if the given decl is not registered.
+  SpirvEvalInfo getDeclEvalInfo(const ValueDecl *decl);
 
   /// \brief Returns the <result-id> for the given function if already
   /// registered; otherwise, treats the given function as a normal decl and
@@ -429,6 +432,9 @@ public:
   /// OpEmitVertex in GS.
   bool writeBackOutputStream(const NamedDecl *decl, QualType type,
                              uint32_t value);
+
+  /// \brief Inverts SV_Position.y is requested.
+  uint32_t invertYIfRequested(uint32_t position);
 
   /// \brief Decorates all stage input and output variables with proper
   /// location and returns true on success.
@@ -506,6 +512,7 @@ private:
     CBuffer,
     TBuffer,
     PushConstant,
+    Globals,
   };
 
   /// Creates a variable of struct type with explicit layout decorations.
@@ -517,22 +524,14 @@ private:
   /// TextureBuffers, and PushConstants. usageKind must be set properly
   /// depending on the usage kind.
   ///
+  /// If arraySize is 0, the variable will be created as a struct ; if arraySize
+  /// is > 0, the variable will be created as an array; if arraySize is -1, the
+  /// variable will be created as a runtime array.
+  ///
   /// Panics if the DeclContext is neither HLSLBufferDecl or RecordDecl.
-  uint32_t createVarOfExplicitLayoutStruct(const DeclContext *decl,
-                                           ContextUsageKind usageKind,
-                                           llvm::StringRef typeName,
-                                           llvm::StringRef varName);
-
-  /// A struct containing information about a particular HLSL semantic.
-  struct SemanticInfo {
-    llvm::StringRef str;            ///< The original semantic string
-    const hlsl::Semantic *semantic; ///< The unique semantic object
-    llvm::StringRef name;           ///< The semantic string without index
-    uint32_t index;                 ///< The semantic index
-    SourceLocation loc;             ///< Source code location
-
-    bool isValid() const { return semantic != nullptr; }
-  };
+  uint32_t createStructOrStructArrayVarOfExplicitLayout(
+      const DeclContext *decl, int arraySize, ContextUsageKind usageKind,
+      llvm::StringRef typeName, llvm::StringRef varName);
 
   /// Returns the given decl's HLSL semantic information.
   static SemanticInfo getStageVarSemantic(const NamedDecl *decl);
@@ -562,7 +561,7 @@ private:
   /// the children of this decl, and the children of this decl will be using
   /// the semantic in inheritSemantic, with index increasing sequentially.
   bool createStageVars(const hlsl::SigPoint *sigPoint, const NamedDecl *decl,
-                       bool asInput, QualType type, uint32_t arraySize,
+                       bool asInput, QualType asType, uint32_t arraySize,
                        const llvm::StringRef namePrefix,
                        llvm::Optional<uint32_t> invocationId, uint32_t *value,
                        bool noWriteBack, SemanticInfo *inheritSemantic);
@@ -573,6 +572,9 @@ private:
   /// creating a stage input/output variable.
   uint32_t createSpirvStageVar(StageVar *, const NamedDecl *decl,
                                const llvm::StringRef name, SourceLocation);
+
+  /// Returns true if all vk:: attributes usages are valid.
+  bool validateVKAttributes(const NamedDecl *decl);
 
   /// Returns true if all vk::builtin usages are valid.
   bool validateVKBuiltins(const NamedDecl *decl,
@@ -587,12 +589,15 @@ private:
   /// structured buffer. Handles AssocCounter#1 and AssocCounter#2 (see the
   /// comment of CounterVarFields).
   ///
+  /// declId is the SPIR-V <result-id> for the given decl. It should be non-zero
+  /// for non-alias buffers.
+  ///
   /// The counter variable will be created as an alias variable (of
   /// pointer-to-pointer type in Private storage class) if isAlias is true.
   ///
   /// Note: isAlias - legalization specific code
   void
-  createCounterVar(const DeclaratorDecl *decl, bool isAlias,
+  createCounterVar(const DeclaratorDecl *decl, uint32_t declId, bool isAlias,
                    const llvm::SmallVector<uint32_t, 4> *indices = nullptr);
   /// Creates all assoicated counter variables by recursively visiting decl's
   /// fields. Handles AssocCounter#3 and AssocCounter#4 (see the comment of
@@ -621,7 +626,8 @@ private:
   ASTContext &astContext;
   DiagnosticsEngine &diags;
 
-  TypeTranslator typeTranslator;
+  TypeTranslator &typeTranslator;
+  FeatureManager &featureManager;
 
   uint32_t entryFunctionId;
 
@@ -716,6 +722,14 @@ public:
   GlPerVertex glPerVertex;
 };
 
+hlsl::Semantic::Kind SemanticInfo::getKind() const {
+  assert(semantic);
+  return semantic->GetKind();
+}
+bool SemanticInfo::isTarget() const {
+  return semantic && semantic->GetKind() == hlsl::Semantic::Kind::Target;
+}
+
 void CounterIdAliasPair::assign(const CounterIdAliasPair &srcPair,
                                 ModuleBuilder &builder,
                                 TypeTranslator &translator) const {
@@ -726,12 +740,14 @@ void CounterIdAliasPair::assign(const CounterIdAliasPair &srcPair,
 DeclResultIdMapper::DeclResultIdMapper(const hlsl::ShaderModel &model,
                                        ASTContext &context,
                                        ModuleBuilder &builder,
+                                       TypeTranslator &translator,
+                                       FeatureManager &features,
                                        const EmitSPIRVOptions &options)
     : shaderModel(model), theBuilder(builder), spirvOptions(options),
       astContext(context), diags(context.getDiagnostics()),
-      typeTranslator(context, builder, diags, options), entryFunctionId(0),
+      typeTranslator(translator), featureManager(features), entryFunctionId(0),
       laneCountBuiltinId(0), laneIndexBuiltinId(0), needsLegalization(false),
-      glPerVertex(model, context, builder, typeTranslator, options.invertY) {}
+      glPerVertex(model, context, builder, typeTranslator) {}
 
 bool DeclResultIdMapper::decorateStageIOLocations() {
   // Try both input and output even if input location assignment failed

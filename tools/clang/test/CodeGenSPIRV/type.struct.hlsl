@@ -58,6 +58,7 @@ void main() {
   T t;
 
 // CHECK: %R = OpTypeStruct %v2float
+
 // CHECK: %r0 = OpVariable %_ptr_Function_R Function
   struct R {
     float2 rVal;

@@ -242,6 +242,8 @@ static void addHLSLPasses(bool HLSLHighLevel, unsigned OptLevel, hlsl::HLSLExten
     MPM.add(createLowerStaticGlobalIntoAlloca());
     // mem2reg
     MPM.add(createPromoteMemoryToRegisterPass());
+
+    MPM.add(createDxilConvergentMarkPass());
   }
 
   if (OptLevel > 2) {
@@ -256,11 +258,10 @@ static void addHLSLPasses(bool HLSLHighLevel, unsigned OptLevel, hlsl::HLSLExten
   MPM.add(createDxilLegalizeStaticResourceUsePass());
   MPM.add(createDxilGenerationPass(NoOpt, ExtHelper));
   MPM.add(createDxilLoadMetadataPass()); // Ensure DxilModule is loaded for optimizations.
-
-  MPM.add(createSimplifyInstPass());
-
   // Propagate precise attribute.
   MPM.add(createDxilPrecisePropagatePass());
+
+  MPM.add(createSimplifyInstPass());
 
   // scalarize vector to scalar
   MPM.add(createScalarizerPass());
@@ -302,6 +303,7 @@ void PassManagerBuilder::populateModulePassManager(
     // HLSL Change Begins.
     addHLSLPasses(HLSLHighLevel, OptLevel, HLSLExtensionsCodeGen, MPM);
     if (!HLSLHighLevel) {
+      MPM.add(createDxilConvergentClearPass());
       MPM.add(createMultiDimArrayToOneDimArrayPass());
       MPM.add(createDxilCondenseResourcesPass());
       MPM.add(createDxilLegalizeSampleOffsetPass());
@@ -574,6 +576,7 @@ void PassManagerBuilder::populateModulePassManager(
 
   // HLSL Change Begins.
   if (!HLSLHighLevel) {
+    MPM.add(createDxilConvergentClearPass());
     MPM.add(createMultiDimArrayToOneDimArrayPass());
     MPM.add(createDxilCondenseResourcesPass());
     MPM.add(createDeadCodeEliminationPass());

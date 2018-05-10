@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "clang/AST/Type.h"
+#include "clang/SPIRV/FeatureManager.h"
 #include "clang/SPIRV/InstBuilder.h"
 #include "clang/SPIRV/SPIRVContext.h"
 #include "clang/SPIRV/Structure.h"
@@ -35,7 +36,7 @@ namespace spirv {
 class ModuleBuilder {
 public:
   /// \brief Constructs a ModuleBuilder with the given SPIR-V context.
-  explicit ModuleBuilder(SPIRVContext *);
+  ModuleBuilder(SPIRVContext *, FeatureManager *features, bool enableReflect);
 
   /// \brief Returns the associated SPIRVContext.
   inline SPIRVContext *getSPIRVContext();
@@ -154,6 +155,17 @@ public:
   uint32_t createSpecConstantBinaryOp(spv::Op op, uint32_t resultType,
                                       uint32_t lhs, uint32_t rhs);
 
+  /// \brief Creates an operation with the given OpGroupNonUniform* SPIR-V
+  /// opcode. Returns the <result-id> for the result.
+  uint32_t createGroupNonUniformOp(spv::Op op, uint32_t resultType,
+                                   uint32_t execScope);
+  uint32_t createGroupNonUniformUnaryOp(
+      spv::Op op, uint32_t resultType, uint32_t execScope, uint32_t operand,
+      llvm::Optional<spv::GroupOperation> groupOp = llvm::None);
+  uint32_t createGroupNonUniformBinaryOp(spv::Op op, uint32_t resultType,
+                                         uint32_t execScope, uint32_t operand1,
+                                         uint32_t operand2);
+
   /// \brief Creates an atomic instruction with the given parameters.
   /// Returns the <result-id> for the result.
   uint32_t createAtomicOp(spv::Op opcode, uint32_t resultType,
@@ -187,10 +199,13 @@ public:
   /// If residencyCodeId is not zero, the sparse version of the instructions
   /// will be used, and the SPIR-V instruction for storing the resulting
   /// residency code will also be emitted.
+  ///
+  /// If isNonUniform is true, the sampled image will be decorated with
+  /// NonUniformEXT.
   uint32_t createImageSample(uint32_t texelType, uint32_t imageType,
                              uint32_t image, uint32_t sampler,
-                             uint32_t coordinate, uint32_t compareVal,
-                             uint32_t bias, uint32_t lod,
+                             bool isNonUniform, uint32_t coordinate,
+                             uint32_t compareVal, uint32_t bias, uint32_t lod,
                              std::pair<uint32_t, uint32_t> grad,
                              uint32_t constOffset, uint32_t varOffset,
                              uint32_t constOffsets, uint32_t sample,
@@ -223,12 +238,15 @@ public:
   /// If residencyCodeId is not zero, the sparse version of the instructions
   /// will be used, and the SPIR-V instruction for storing the resulting
   /// residency code will also be emitted.
+  /// If isNonUniform is true, the sampled image will be decorated with
+  /// NonUniformEXT.
   uint32_t createImageGather(uint32_t texelType, uint32_t imageType,
                              uint32_t image, uint32_t sampler,
-                             uint32_t coordinate, uint32_t component,
-                             uint32_t compareVal, uint32_t constOffset,
-                             uint32_t varOffset, uint32_t constOffsets,
-                             uint32_t sample, uint32_t residencyCodeId);
+                             bool isNonUniform, uint32_t coordinate,
+                             uint32_t component, uint32_t compareVal,
+                             uint32_t constOffset, uint32_t varOffset,
+                             uint32_t constOffsets, uint32_t sample,
+                             uint32_t residencyCodeId);
 
   /// \brief Creates an OpImageSparseTexelsResident SPIR-V instruction for the
   /// given Resident Code and returns the <result-id> of the instruction.
@@ -305,6 +323,8 @@ public:
 
   // === SPIR-V Module Structure ===
 
+  inline void useSpirv1p3();
+
   inline void requireCapability(spv::Capability);
 
   inline void setAddressingModel(spv::AddressingModel);
@@ -316,12 +336,19 @@ public:
                             std::string targetName,
                             llvm::ArrayRef<uint32_t> interfaces);
 
+  inline void setShaderModelVersion(uint32_t major, uint32_t minor);
+
+  /// \brief Sets the source file name and the <result-id> for the OpString for
+  /// the file name.
+  inline void setSourceFileName(uint32_t id, std::string name);
+
   /// \brief Adds an execution mode to the module under construction.
   void addExecutionMode(uint32_t entryPointId, spv::ExecutionMode em,
                         llvm::ArrayRef<uint32_t> params);
 
-  /// \brief Adds an extension to the module under construction.
-  inline void addExtension(llvm::StringRef extension);
+  /// \brief Adds an extension to the module under construction for translating
+  /// the given target at the given source location.
+  void addExtension(Extension, llvm::StringRef target, SourceLocation);
 
   /// \brief If not added already, adds an OpExtInstImport (import of extended
   /// instruction set) of the GLSL instruction set. Returns the <result-id> for
@@ -354,6 +381,9 @@ public:
   /// \brief Decorates the given target <result-id> with the given location.
   void decorateLocation(uint32_t targetId, uint32_t location);
 
+  /// \brief Decorates the given target <result-id> with the given index.
+  void decorateIndex(uint32_t targetId, uint32_t index);
+
   /// \brief Decorates the given target <result-id> with the given descriptor
   /// set and binding number.
   void decorateDSetBinding(uint32_t targetId, uint32_t setNumber,
@@ -365,6 +395,14 @@ public:
   /// \brief Decorates the given target <result-id> with the given input
   /// attchment index number.
   void decorateInputAttachmentIndex(uint32_t targetId, uint32_t indexNumber);
+
+  /// \brief Decorates the given main buffer with the given counter buffer.
+  void decorateCounterBufferId(uint32_t mainBufferId, uint32_t counterBufferId);
+
+  /// \brief Decorates the given target <result-id> with the given HLSL semantic
+  /// string.
+  void decorateHlslSemantic(uint32_t targetId, llvm::StringRef semantic,
+                            llvm::Optional<uint32_t> memberIdx = llvm::None);
 
   /// \brief Decorates the given target <result-id> with the given decoration
   /// (without additional parameters).
@@ -384,7 +422,8 @@ public:
   uint32_t getFloat32Type();
   uint32_t getFloat64Type();
   uint32_t getVecType(uint32_t elemType, uint32_t elemCount);
-  uint32_t getMatType(QualType elemType, uint32_t colType, uint32_t colCount);
+  uint32_t getMatType(QualType elemType, uint32_t colType, uint32_t colCount,
+                      Type::DecorationSet decorations = {});
   uint32_t getPointerType(uint32_t pointeeType, spv::StorageClass);
   uint32_t getStructType(llvm::ArrayRef<uint32_t> fieldTypes,
                          llvm::StringRef structName = "",
@@ -444,9 +483,11 @@ private:
       uint32_t sample, uint32_t minLod,
       llvm::SmallVectorImpl<uint32_t> *orderedParams);
 
-  SPIRVContext &theContext; ///< The SPIR-V context.
-  SPIRVModule theModule;    ///< The module under building.
+  SPIRVContext &theContext;       ///< The SPIR-V context.
+  FeatureManager *featureManager; ///< SPIR-V version/extension manager.
+  const bool allowReflect;        ///< Whether allow reflect instructions.
 
+  SPIRVModule theModule;                 ///< The module under building.
   std::unique_ptr<Function> theFunction; ///< The function under building.
   OrderedBasicBlockMap basicBlocks;      ///< The basic blocks under building.
   BasicBlock *insertPoint;               ///< The current insertion point.
@@ -484,8 +525,12 @@ void ModuleBuilder::addEntryPoint(spv::ExecutionModel em, uint32_t targetId,
   theModule.addEntryPoint(em, targetId, std::move(targetName), interfaces);
 }
 
-void ModuleBuilder::addExtension(llvm::StringRef extension) {
-  theModule.addExtension(extension);
+void ModuleBuilder::setShaderModelVersion(uint32_t major, uint32_t minor) {
+  theModule.setShaderModelVersion(major * 100 + minor * 10);
+}
+
+void ModuleBuilder::setSourceFileName(uint32_t id, std::string name) {
+  theModule.setSourceFileName(id, std::move(name));
 }
 
 } // end namespace spirv

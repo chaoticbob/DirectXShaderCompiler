@@ -236,8 +236,6 @@ def ignore_line_directives : Flag<["-", "/"], "ignore-line-directives">, HelpTex
 // SPIRV Change Starts
 def spirv : Flag<["-"], "spirv">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
   HelpText<"Generate SPIR-V code">;
-def fvk_ignore_unused_resources : Flag<["-"], "fvk-ignore-unused-resources">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
-  HelpText<"Do not emit SPIR-V code for unused resources">;
 def fvk_stage_io_order_EQ : Joined<["-"], "fvk-stage-io-order=">, Group<spirv_Group>, Flags<[CoreOption, DriverOption, HelpHidden]>,
   HelpText<"Specify Vulkan stage I/O location assignment order">;
 def fvk_b_shift : MultiArg<["-"], "fvk-b-shift", 2>, MetaVarName<"<shift> <space>">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
@@ -250,6 +248,16 @@ def fvk_u_shift : MultiArg<["-"], "fvk-u-shift", 2>, MetaVarName<"<shift> <space
   HelpText<"Specify Vulkan binding number shift for u-type register">;
 def fvk_invert_y: Flag<["-"], "fvk-invert-y">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
   HelpText<"Invert SV_Position.y in VS/DS/GS to accommodate Vulkan's coordinate system">;
+def fvk_use_gl_layout: Flag<["-"], "fvk-use-gl-layout">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Use strict OpenGL std140/std430 memory layout for Vulkan resources">;
+def fvk_use_dx_layout: Flag<["-"], "fvk-use-dx-layout">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Use DirectX memory layout for Vulkan resources">;
+def fspv_reflect: Flag<["-"], "fspv-reflect">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Emit additional SPIR-V instructions to aid reflection">;
+def fspv_extension_EQ : Joined<["-"], "fspv-extension=">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Specify SPIR-V extension permitted to use">;
+def fspv_target_env_EQ : Joined<["-"], "fspv-target-env=">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Specify the target environment: vulkan1.0 (default) or vulkan1.1">;
 // SPIRV Change Ends
 
 //////////////////////////////////////////////////////////////////////////////
